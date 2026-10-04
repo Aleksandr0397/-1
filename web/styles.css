@@ -54,3 +54,30 @@
 .history-card .button{margin-top:10px}
 #history-more{margin-top:20px}
 @media(max-width:620px){.header-actions .cart-nav{flex:1}.header-actions .cart-nav #cart-link{flex:1}.header-actions .cart-nav #toggle-cart{flex:0 0 40px}.full-cart .order-actions{grid-template-columns:1fr}.history-card,.account-card{padding:20px}.history-positions li{flex-direction:column;gap:6px}.history-positions li span:last-child{text-align:left}}
+
+.sort-button{display:inline-flex;align-items:center;gap:7px;border:0;border-radius:6px;padding:5px 6px;margin-left:-6px;background:transparent;color:inherit;font:inherit;min-height:36px}
+.sort-button:hover{background:#edf2ff;color:var(--blue)}
+.catalog-table th[aria-sort="ascending"],.catalog-table th[aria-sort="descending"]{color:var(--blue);font-weight:600}
+.catalog-table tr.in-cart{background:#eef4ff}
+.product-cart-status{display:block;color:var(--blue);font-size:.8125rem;font-weight:600;margin-top:6px}
+.quantity-stepper{display:inline-flex;align-items:stretch;width:112px;max-width:100%}
+.quantity-stepper input{width:80px;min-width:0;min-height:44px;border-radius:9px 0 0 9px;margin:0;appearance:textfield;-moz-appearance:textfield}
+.quantity-stepper input::-webkit-inner-spin-button,.quantity-stepper input::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}
+.quantity-arrows{display:grid;grid-template-rows:1fr 1fr;width:32px;flex:0 0 32px;border:1px solid #cbd4e3;border-left:0;border-radius:0 9px 9px 0;background:#f6f8ff}
+.quantity-arrows button{border:0;background:transparent;color:var(--blue);min-height:22px;padding:0;font-size:.75rem;line-height:1;border-radius:0}
+.quantity-arrows button:first-child{border-bottom:1px solid #dde3ed;border-radius:0 8px 0 0}
+.quantity-arrows button:last-child{border-radius:0 0 8px 0}
+.quantity-arrows button:hover:not(:disabled){background:#e5edff}
+.quantity-arrows button:focus-visible{outline-offset:-3px}
+@media(max-width:620px){
+  .header-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;align-items:stretch}
+  .header-actions .button{width:100%;white-space:normal;flex:initial}
+  .header-actions .cart-nav{width:100%;min-width:0}
+  .catalog-table thead{position:static;display:block;width:auto;height:auto;overflow:visible;clip:auto}
+  .catalog-table thead tr{display:flex;gap:20px;padding:8px 16px;background:#f9fbfe;border:0}
+  .catalog-table thead th{padding:0;background:transparent}
+  .catalog-table thead th:nth-child(n+3){display:none}
+  .sort-button{min-height:44px}
+  .catalog-table tbody tr{grid-template-columns:minmax(0,1fr) 112px 102px}
+  .header-actions #account-link{flex:0 0 auto;padding-left:12px;padding-right:12px}
+}

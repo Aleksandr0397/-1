@@ -1,11 +1,14 @@
 'use strict';
 
 const byId = (id) => document.getElementById(id);
-const state = { config: null, user: null, catalog: { catalog_version: null, products: [] }, products: new Map(), indexed: [], cart: new Map(), shown: 60, filtered: [], busy: false, sentSignature: null };
-const storageKey = 'okunev-order-cart-v1';
+const state = { config: null, user: null, catalog: { catalog_version: null, products: [] }, products: new Map(), indexed: [], cart: new Map(), shown: 60, filtered: [], sort: null, busy: false, sentSignature: null };
+const legacyStorageKey = 'okunev-order-cart-v1';
+const guestStorageKey = 'okunev-order-cart-v2:guest';
+let storageKey = null;
 const fullCart = document.body.dataset.view === 'cart';
 const money = new Intl.NumberFormat('ru-RU', { style: 'currency', currency: 'RUB', minimumFractionDigits: 0, maximumFractionDigits: 2 });
 const wholeNumbers = new Intl.NumberFormat('ru-RU');
+const names = new Intl.Collator('ru-RU', { numeric: true, sensitivity: 'base', ignorePunctuation: true });
 let toastTimer;
 let searchTimer;
 
@@ -46,9 +49,31 @@ async function jsonApi(url, options) {
   return response.json();
 }
 function saveCart() {
+  if (!storageKey) return;
   try { localStorage.setItem(storageKey, JSON.stringify({ catalog_version: state.catalog.catalog_version, customer: customerFields(), items: Array.from(state.cart, ([product_id, quantity]) => ({ product_id, quantity })) })); } catch (_) { /* The basket still works when browser storage is unavailable. */ }
 }
+function selectCartStorage() {
+  storageKey = state.user ? 'okunev-order-cart-v2:user:' + state.user.id : guestStorageKey;
+  try {
+    const legacy = localStorage.getItem(legacyStorageKey);
+    if (legacy) {
+      // The old basket has no owner. Only an anonymous visit can safely migrate it.
+      if (!state.user && !localStorage.getItem(guestStorageKey)) localStorage.setItem(guestStorageKey, legacy);
+      localStorage.removeItem(legacyStorageKey);
+    }
+    if (state.user) {
+      const guest = localStorage.getItem(guestStorageKey);
+      if (guest) {
+        const personal = localStorage.getItem(storageKey);
+        if (!personal) localStorage.setItem(storageKey, guest);
+        localStorage.removeItem(guestStorageKey);
+        if (personal && JSON.parse(guest)?.items?.length) notify('Восстановлен ваш личный заказ. Товары гостевой корзины не добавлены.');
+      }
+    }
+  } catch (_) { /* Do not transfer or expose another account's basket if storage fails. */ }
+}
 function restoreCart() {
+  if (!storageKey) return;
   try {
     const saved = JSON.parse(localStorage.getItem(storageKey) || 'null');
     if (!saved) return;
@@ -73,10 +98,46 @@ function validQuantity(value) { const number = Number(value); return Number.isIn
 function quantityInput(product, value, className) {
   const input = node('input', className);
   input.type = 'number'; input.min = '1'; input.max = '999999'; input.step = '1'; input.value = String(value);
+  input.dataset.productId = product.id;
   input.inputMode = 'numeric'; input.setAttribute('aria-label', 'Количество: ' + product.name);
   input.addEventListener('keydown', (event) => { if (['.', ',', 'e', 'E', '-', '+'].includes(event.key)) event.preventDefault(); });
   input.addEventListener('change', () => { if (validQuantity(input.value)) input.value = String(Number(input.value)); });
   return input;
+}
+function quantityStepper(input) {
+  const wrapper = node('div', 'quantity-stepper');
+  const arrows = node('div', 'quantity-arrows');
+  const up = node('button', 'quantity-increase', '▲');
+  const down = node('button', 'quantity-decrease', '▼');
+  for (const [button, direction, label] of [[up, 1, 'Увеличить количество'], [down, -1, 'Уменьшить количество']]) {
+    button.type = 'button';
+    button.setAttribute('aria-label', label + ': ' + input.getAttribute('aria-label').replace(/^Количество: /, ''));
+    button.addEventListener('mousedown', (event) => event.preventDefault());
+    button.addEventListener('click', () => {
+      if (!validQuantity(input.value)) {
+        input.setCustomValidity('Введите целое количество от 1 до 999 999.'); input.reportValidity(); return;
+      }
+      input.setCustomValidity('');
+      input.value = String(Math.min(999999, Math.max(1, Number(input.value) + direction)));
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      const current = input.isConnected ? input : byId('cart-items').querySelector('input[data-product-id="' + CSS.escape(input.dataset.productId) + '"]');
+      current?.closest('.quantity-stepper')?.querySelector(direction === 1 ? '.quantity-increase' : '.quantity-decrease')?.focus({ preventScroll: true });
+    });
+  }
+  function updateLimits() { up.disabled = Number(input.value) >= 999999; down.disabled = Number(input.value) <= 1; }
+  input.addEventListener('input', updateLimits); input.addEventListener('change', updateLimits);
+  updateLimits(); arrows.append(up, down); wrapper.append(input, arrows);
+  return wrapper;
+}
+function markCatalogSelection() {
+  for (const row of byId('products').children) {
+    const quantity = state.cart.get(row.dataset.productId);
+    row.classList.toggle('in-cart', Boolean(quantity));
+    const badge = row.querySelector('.product-cart-status');
+    badge.hidden = !quantity;
+    badge.textContent = quantity ? 'В корзине: ' + wholeNumbers.format(quantity) : '';
+  }
 }
 function setCatalog(catalog, restore = false) {
   const previous = state.catalog.catalog_version;
@@ -94,21 +155,38 @@ function setCatalog(catalog, restore = false) {
 }
 function filterProducts() {
   const terms = normalize(byId('search').value).trim().split(/\s+/).filter(Boolean);
-  state.filtered = terms.length ? state.indexed.filter((entry) => terms.every((term) => entry.search.includes(term))).map((entry) => entry.product) : state.catalog.products;
+  state.filtered = terms.length ? state.indexed.filter((entry) => terms.every((term) => entry.search.includes(term))).map((entry) => entry.product) : [...state.catalog.products];
+  if (state.sort) {
+    const { field, direction } = state.sort;
+    state.filtered.sort((a, b) => direction * (field === 'price' ? Number(a.price) - Number(b.price) : names.compare(a.name, b.name)));
+  }
   state.shown = 60;
   renderProducts();
+}
+function sortProducts(field) {
+  state.sort = { field, direction: state.sort?.field === field ? -state.sort.direction : 1 };
+  for (const kind of ['name', 'price']) {
+    const button = byId('sort-' + kind);
+    if (!button) continue;
+    const active = kind === field;
+    button.closest('th').setAttribute('aria-sort', active ? (state.sort.direction === 1 ? 'ascending' : 'descending') : 'none');
+    byId('sort-' + kind + '-direction').textContent = active ? (state.sort.direction === 1 ? '↑' : '↓') : '↕';
+  }
+  filterProducts();
 }
 function renderProducts() {
   const fragment = document.createDocumentFragment();
   for (const product of state.filtered.slice(0, state.shown)) {
     const row = node('tr');
+    row.dataset.productId = product.id;
     const description = node('td');
     description.append(node('div', 'product-name', product.name));
     description.append(node('span', 'product-meta', [product.sku ? 'Артикул ' + product.sku : '', product.unit || 'шт'].filter(Boolean).join(' · ')));
+    description.append(node('span', 'product-cart-status'));
     const price = node('td', 'product-price', money.format(Number(product.price)));
     const quantityCell = node('td');
     const input = quantityInput(product, 1, 'product-quantity');
-    quantityCell.append(input);
+    quantityCell.append(quantityStepper(input));
     const action = node('td');
     const button = node('button', 'button product-add', 'В заказ');
     button.type = 'button'; button.setAttribute('aria-label', 'Добавить в заказ: ' + product.name);
@@ -127,6 +205,7 @@ function renderProducts() {
     action.append(button); row.append(description, price, quantityCell, action); fragment.append(row);
   }
   byId('products').replaceChildren(fragment);
+  markCatalogSelection();
   const hasResults = state.filtered.length > 0;
   byId('table-wrap').hidden = !hasResults;
   byId('catalog-empty').hidden = hasResults;
@@ -182,7 +261,7 @@ function renderCart() {
       if (!validQuantity(input.value)) { input.value = String(state.cart.get(id)); notify('Укажите целое количество от 1 до 999 999.'); return; }
       state.cart.set(id, Number(input.value)); basketChanged(); renderCart();
     });
-    wrap.append(input, node('span', 'cart-unit', product.unit || 'шт'));
+    wrap.append(quantityStepper(input), node('span', 'cart-unit', product.unit || 'шт'));
     const amount = lineTotalCents(product, quantity); totalCents += amount;
     controls.append(wrap, node('span', 'cart-line-total', formatCents(amount)));
     item.append(top, controls); fragment.append(item);
@@ -197,6 +276,7 @@ function renderCart() {
   byId('mobile-count').textContent = plural(state.cart.size);
   byId('mobile-order-bar').hidden = !state.cart.size;
   document.body.classList.toggle('has-cart', state.cart.size > 0);
+  markCatalogSelection();
   updateActions();
 }
 function customerFields() {
@@ -271,24 +351,31 @@ async function loadCatalog(restore) {
   }
 }
 async function start() {
-  const configTask = jsonApi('/api/config').then(async (config) => {
+  try {
+    const config = await jsonApi('/api/config');
     state.config = config;
     byId('mail-note').textContent = config.mail_ready ? 'Заказ отправится поставщику по e-mail с Excel-вложением.' : 'Отправка почты пока не подключена. Готовый заказ можно скачать в Excel.';
     byId('admin-password').required = config.upload_requires_password;
     const note = byId('history-note');
     if (config.history_ready) {
-      try { state.user = (await jsonApi('/api/accounts/me')).user; } catch (_) { state.user = null; }
+      const identity = await jsonApi('/api/accounts/me');
+      state.user = identity.user;
       note.textContent = state.user ? 'Готовые заказы сохраняются в вашем личном списке.' : 'Войдите, чтобы оформлять и сохранять заказы: ';
       const link = node('a', '', state.user ? 'Мои заказы' : 'Вход и регистрация'); link.href = '/orders/';
       note.append(document.createTextNode(' '), link);
     } else note.textContent = 'Сохранение истории на сервере пока не подключено. Excel-заказ можно скачать.';
+    selectCartStorage();
+    if (byId('account-link')) byId('account-link').textContent = state.user ? 'Мой аккаунт' : 'Войти';
     updateActions();
-  }).catch(() => { byId('mail-note').textContent = 'Отправка временно недоступна. Готовый заказ можно скачать в Excel.'; });
-  await Promise.allSettled([configTask, loadCatalog(true)]);
+  } catch (_) {
+    byId('mail-note').textContent = 'Не удалось проверить настройки и аккаунт. Обновите страницу, чтобы восстановить свой заказ.';
+  }
+  await loadCatalog(true);
 }
 
 byId('search').addEventListener('input', () => { clearTimeout(searchTimer); searchTimer = setTimeout(filterProducts, 60); });
 byId('load-more').addEventListener('click', () => { state.shown += 60; renderProducts(); });
+for (const field of ['name', 'price']) byId('sort-' + field)?.addEventListener('click', () => sortProducts(field));
 byId('clear-cart').addEventListener('click', () => { state.cart.clear(); basketChanged(); renderCart(); });
 byId('customer-form').addEventListener('input', () => { state.sentSignature = null; saveCart(); updateActions(); });
 byId('customer-form').addEventListener('submit', (event) => event.preventDefault());
@@ -305,4 +392,5 @@ byId('toggle-cart').addEventListener('click', () => setCartOpen(byId('order-pane
 byId('close-cart').addEventListener('click', () => setCartOpen(false));
 byId('jump-to-order').addEventListener('click', () => setCartOpen(byId('order-panel').hidden, true));
 byId('order-panel').addEventListener('keydown', (event) => { if (event.key === 'Escape') { event.preventDefault(); setCartOpen(false); } });
+window.addEventListener('pageshow', (event) => { if (event.persisted) window.location.reload(); });
 start();

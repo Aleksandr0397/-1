@@ -4,6 +4,19 @@ const money = new Intl.NumberFormat('ru-RU', { style: 'currency', currency: 'RUB
 const dates = new Intl.DateTimeFormat('ru-RU', { dateStyle: 'long', timeStyle: 'short' });
 let mode = 'login';
 let nextOffset = null;
+function prepareGuestCart(user) {
+  try {
+    const legacyKey = 'okunev-order-cart-v1';
+    const guestKey = 'okunev-order-cart-v2:guest';
+    const legacy = localStorage.getItem(legacyKey);
+    if (!legacy) return;
+    if (!user && !localStorage.getItem(guestKey)) {
+      const draft = JSON.parse(legacy);
+      if (draft && Array.isArray(draft.items)) localStorage.setItem(guestKey, legacy);
+    }
+    localStorage.removeItem(legacyKey);
+  } catch (_) { /* Accounts still work when browser storage is unavailable. */ }
+}
 function node(tag, className, text) {
   const item = document.createElement(tag);
   if (className) item.className = className;
@@ -22,6 +35,7 @@ async function jsonApi(url, options = {}) {
   return body;
 }
 function accountView(user) {
+  el('account-link').textContent = user ? 'Мой аккаунт' : 'Войти';
   el('account-card').hidden = Boolean(user);
   el('account-bar').hidden = !user;
   el('account-user').textContent = user?.email || '';
@@ -83,6 +97,7 @@ async function loadOrders(append = false) {
 async function start() {
   try {
     const result = await jsonApi('/api/accounts/me');
+    prepareGuestCart(result.user);
     if (!result.available) {
       el('account-card').hidden = true; el('account-bar').hidden = true;
       message('Хранилище заказов ещё не подключено. Пока можно собрать корзину и скачать Excel.');

@@ -26,6 +26,7 @@
         <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 16V4m-4 4 4-4 4 4M4 15v5h16v-5"/></svg>
         Загрузить прайс
       </button>
+      <a class="button button-quiet" href="/orders/" id="account-link">Войти</a>
       </div>
     </div>
   </header>
@@ -47,7 +48,7 @@
       <div class="error-box" id="load-error" role="alert" hidden><span></span><button class="button button-quiet" id="retry-load" type="button">Повторить</button></div>
       <div class="catalog-table-wrap" id="table-wrap" hidden>
         <table class="catalog-table">
-          <thead><tr><th scope="col">Товар</th><th scope="col">Цена</th><th scope="col">Количество</th><th scope="col"><span class="sr-only">Добавить в заказ</span></th></tr></thead>
+          <thead><tr><th scope="col" aria-sort="none"><button class="sort-button" id="sort-name" type="button" aria-controls="products">Товар <span id="sort-name-direction" aria-hidden="true">↕</span></button></th><th scope="col" aria-sort="none"><button class="sort-button" id="sort-price" type="button" aria-controls="products">Цена <span id="sort-price-direction" aria-hidden="true">↕</span></button></th><th scope="col">Количество</th><th scope="col"><span class="sr-only">Добавить в заказ</span></th></tr></thead>
           <tbody id="products"></tbody>
         </table>
         <button class="button button-quiet load-more" id="load-more" type="button" hidden>Показать ещё</button>
