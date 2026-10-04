@@ -126,4 +126,5 @@ el('history-more').addEventListener('click', async () => {
   try { await loadOrders(true); } catch (error) { message(error.message, true); }
   finally { el('history-more').disabled = false; }
 });
+window.addEventListener('pageshow', (event) => { if (event.persisted) window.location.reload(); });
 start();
