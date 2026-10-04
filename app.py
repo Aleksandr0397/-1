@@ -372,7 +372,7 @@ class OrderItem(BaseModel):
     @classmethod
     def validate_quantity(cls, value):
         if isinstance(value, bool) or not isinstance(value, (str, int, float, Decimal)):
-            raise ValueError("Количество должно быть числом.")
+            raise ValueError("Количество должно быть целым числом.")
         text = str(value).strip().replace(",", ".")
         if len(text) > 40:
             raise ValueError("Количество слишком велико.")
@@ -380,11 +380,11 @@ class OrderItem(BaseModel):
             quantity = Decimal(text)
             if not quantity.is_finite() or quantity <= 0 or quantity > Decimal("999999"):
                 raise ValueError("Количество должно быть больше нуля и не больше 999999.")
-            if quantity != quantity.quantize(Decimal("0.001")):
-                raise ValueError("Укажите не больше трёх знаков после запятой.")
+            if quantity != quantity.to_integral_value():
+                raise ValueError("Количество должно быть целым числом: 1, 2, 3 и так далее.")
         except InvalidOperation as error:
             raise ValueError("Некорректное количество.") from error
-        return quantity
+        return int(quantity)
 
 
 class OrderRequest(BaseModel):
@@ -436,7 +436,7 @@ def build_order_excel(order, selected, total, order_id, created_at):
     header_row = 2
     append(sheet, ["Наименование", "Заказ↓", "Ед. изм.", "Цена", "Сумма"])
     for product in selected:
-        append(sheet, [product["name"], float(product["quantity"]), product["unit"],
+        append(sheet, [product["name"], product["quantity"], product["unit"],
                        float(Decimal(product["price"])), float(product["line_total"])])
     last_product_row = sheet.max_row
     append(sheet, ["Итого", "", "", "", float(total)])
@@ -451,7 +451,7 @@ def build_order_excel(order, selected, total, order_id, created_at):
         sheet.column_dimensions[column].width = width
     for row in sheet.iter_rows(min_row=header_row + 1):
         row[0].alignment = Alignment(wrap_text=True, vertical="top")
-        row[1].number_format = "0.###"
+        row[1].number_format = "0"
         row[3].number_format = row[4].number_format = '#,##0.00'
     for cell in sheet[sheet.max_row]:
         cell.font = Font(bold=True)

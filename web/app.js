@@ -56,16 +56,21 @@ function restoreCart() {
       if (saved.items?.length) notify('Прайс обновился. Соберите заказ по новым ценам.');
       return;
     }
+    let removedFractional = false;
     for (const item of saved.items || []) {
       if (state.products.has(item.product_id) && validQuantity(item.quantity)) state.cart.set(item.product_id, Number(item.quantity));
+      else if (state.products.has(item.product_id) && Number.isFinite(Number(item.quantity)) && !Number.isInteger(Number(item.quantity))) removedFractional = true;
     }
+    if (removedFractional) { saveCart(); notify('Позиции с дробным количеством удалены из сохранённого заказа. Добавьте их с целым количеством.'); }
   } catch (_) { /* Ignore damaged saved baskets. */ }
 }
-function validQuantity(value) { const number = Number(value); return Number.isFinite(number) && number > 0 && number <= 999999 && Math.abs(number * 1000 - Math.round(number * 1000)) < 0.000001; }
+function validQuantity(value) { const number = Number(value); return Number.isInteger(number) && number >= 1 && number <= 999999; }
 function quantityInput(product, value, className) {
   const input = node('input', className);
-  input.type = 'number'; input.min = '0.001'; input.max = '999999'; input.step = '0.001'; input.value = String(value);
-  input.inputMode = 'decimal'; input.setAttribute('aria-label', 'Количество: ' + product.name);
+  input.type = 'number'; input.min = '1'; input.max = '999999'; input.step = '1'; input.value = String(value);
+  input.inputMode = 'numeric'; input.setAttribute('aria-label', 'Количество: ' + product.name);
+  input.addEventListener('keydown', (event) => { if (['.', ',', 'e', 'E', '-', '+'].includes(event.key)) event.preventDefault(); });
+  input.addEventListener('change', () => { if (validQuantity(input.value)) input.value = String(Number(input.value)); });
   return input;
 }
 function setCatalog(catalog, restore = false) {
@@ -104,8 +109,8 @@ function renderProducts() {
     button.type = 'button'; button.setAttribute('aria-label', 'Добавить в заказ: ' + product.name);
     function add() {
       const quantity = Number(input.value);
-      if (!validQuantity(quantity)) { input.setCustomValidity('Введите количество от 0,001 до 999 999, не больше трёх знаков после запятой.'); input.reportValidity(); return; }
-      const next = Math.round(((state.cart.get(product.id) || 0) + quantity) * 1000) / 1000;
+      if (!validQuantity(quantity)) { input.setCustomValidity('Введите целое количество от 1 до 999 999.'); input.reportValidity(); return; }
+      const next = (state.cart.get(product.id) || 0) + quantity;
       if (!validQuantity(next)) { notify('В заказе слишком большое количество этого товара.'); return; }
       if (!state.cart.has(product.id) && state.cart.size >= 500) { notify('В один заказ можно добавить не больше 500 разных товаров.'); return; }
       input.setCustomValidity(''); state.cart.set(product.id, next); basketChanged(); renderCart();
@@ -133,7 +138,7 @@ function basketChanged() { state.sentSignature = null; feedback('order-feedback'
 function lineTotalCents(product, quantity) {
   const parts = String(product.price).split('.');
   const price = BigInt(parts[0]) * 100n + BigInt((parts[1] || '').padEnd(2, '0').slice(0, 2));
-  return (price * BigInt(Math.round(quantity * 1000)) + 500n) / 1000n;
+  return price * BigInt(quantity);
 }
 function formatCents(cents) {
   const remainder = cents % 100n;
@@ -155,7 +160,7 @@ function renderCart() {
     const wrap = node('div', 'cart-quantity-wrap');
     const input = quantityInput(product, quantity, 'cart-quantity');
     input.addEventListener('change', () => {
-      if (!validQuantity(input.value)) { input.value = String(state.cart.get(id)); notify('Укажите положительное количество, до трёх знаков после запятой.'); return; }
+      if (!validQuantity(input.value)) { input.value = String(state.cart.get(id)); notify('Укажите целое количество от 1 до 999 999.'); return; }
       state.cart.set(id, Number(input.value)); basketChanged(); renderCart();
     });
     wrap.append(input, node('span', 'cart-unit', product.unit || 'шт'));

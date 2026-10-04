@@ -68,7 +68,7 @@ class ApiTests(unittest.TestCase):
         return {
             "catalog_version": catalog["catalog_version"],
             "customer": {"name": "Покупатель", "contact": "buyer@example.com", "comment": "Доставка"},
-            "items": [{"product_id": catalog["products"][0]["id"], "quantity": "1.5"}],
+            "items": [{"product_id": catalog["products"][0]["id"], "quantity": "2"}],
         }
 
     def test_empty_catalog_and_runtime_config(self):
@@ -116,7 +116,7 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(exported.status_code, 200, exported.text)
             sheet = load_workbook(io.BytesIO(exported.content)).active
             self.assertEqual(sheet["A3"].value, "Товар из прайса")
-            self.assertEqual(sheet["E3"].value, 425.25)
+            self.assertEqual(sheet["E3"].value, 567)
         # Once persisted, the bundled snapshot is no longer needed to read the catalog.
         os.remove(path)
         self.assertEqual(self.client.get("/api/catalog").json(), snapshot)
@@ -227,8 +227,9 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(list(sheet.values)[1], ("Наименование", "Заказ↓", "Ед. изм.", "Цена", "Сумма"))
         self.assertEqual(workbook["Информация"]["B3"].value, "Покупатель")
         product_row = next(row for row in rows if "Кабель медный Ёлка" in row)
-        self.assertEqual(product_row[1:5], (1.5, "м", 12.5, 18.75))
-        self.assertEqual(next(row for row in rows if "Итого" in row)[4], 18.75)
+        self.assertEqual(product_row[1:5], (2, "м", 12.5, 25))
+        self.assertEqual(next(row for row in rows if "Итого" in row)[4], 25)
+        self.assertEqual(sheet["B3"].number_format, "0")
         self.assertTrue(sheet.freeze_panes)
 
     def test_untrusted_strings_never_become_spreadsheet_formulas(self):
@@ -266,7 +267,7 @@ class ApiTests(unittest.TestCase):
 
     def test_invalid_quantity_unknown_duplicate_and_empty_items(self):
         order = self.order()
-        for quantity in [0, -1, "NaN", "Infinity", "0.0001", "1000000", True, {"bad": 1}]:
+        for quantity in [0, -1, "NaN", "Infinity", "1000000", True, None, "", "one", "1..0", {"bad": 1}]:
             with self.subTest(quantity=quantity):
                 order["items"][0]["quantity"] = quantity
                 response = self.client.post("/api/orders/export", json=order)
@@ -280,6 +281,27 @@ class ApiTests(unittest.TestCase):
         order["items"] = []
         self.assertEqual(self.client.post("/api/orders/export", json=order).status_code, 422)
 
+    def test_fractional_quantity_rejected_for_export_and_email(self):
+        order = self.order()
+        for quantity in [1.5, 0.001, "1.5", "0.001", "0.0001", "2,5", "1.999"]:
+            for endpoint in ["/api/orders/export", "/api/orders/send"]:
+                with self.subTest(quantity=quantity, endpoint=endpoint):
+                    order["items"][0]["quantity"] = quantity
+                    response = self.client.post(endpoint, json=order)
+                    self.assertEqual(response.status_code, 422, f"Unexpected response status: {response.status_code}")
+
+    def test_whole_quantity_and_integral_representations_export_as_integers(self):
+        order = self.order()
+        for quantity in [1, 2, "3", 1.0, "2.0", 999999]:
+            with self.subTest(quantity=quantity):
+                order["items"][0]["quantity"] = quantity
+                response = self.client.post("/api/orders/export", json=order)
+                self.assertEqual(response.status_code, 200, response.text)
+                sheet = load_workbook(io.BytesIO(response.content)).active
+                self.assertEqual(sheet["B3"].value, int(float(quantity)))
+                self.assertIsInstance(sheet["B3"].value, int)
+                self.assertEqual(sheet["B3"].number_format, "0")
+                self.assertEqual(sheet["D3"].number_format, "#,##0.00")
     def test_reimport_invalidates_stale_basket(self):
         order = self.order()
         self.upload(price_file([["B", "Другой товар", "шт", 99]]))
@@ -288,15 +310,16 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(response.status_code, 409, response.text)
 
     def test_decimal_half_up_and_excel_precision_boundary(self):
-        catalog = self.upload(price_file([["A", "Точное округление", "шт", "1.01"]])).json()
+        catalog = self.upload(price_file([["A", "Точное округление", "шт", "1.005"]])).json()
         order = self.order(catalog)
         response = self.client.post("/api/orders/export", json=order)
         sheet = load_workbook(io.BytesIO(response.content)).active
-        self.assertEqual(sheet["E3"].value, 1.52)
-        self.assertEqual(sheet["E4"].value, 1.52)
+        self.assertEqual(sheet["D3"].value, 1.01)
+        self.assertEqual(sheet["E3"].value, 2.02)
+        self.assertEqual(sheet["E4"].value, 2.02)
         catalog = self.upload(price_file([["A", "Очень дорогой товар", "шт", "999999998.99"]])).json()
         order = self.order(catalog)
-        order["items"][0]["quantity"] = "999998.999"
+        order["items"][0]["quantity"] = "999999"
         response = self.client.post("/api/orders/export", json=order)
         self.assertEqual(response.status_code, 422, response.text)
 
