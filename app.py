@@ -1,6 +1,7 @@
 """Excel catalog, versioned baskets, and email orders for the Окунев website."""
 
 import io
+import json
 import logging
 import os
 import re
@@ -111,9 +112,57 @@ def database():
                 name TEXT NOT NULL, unit TEXT NOT NULL, price TEXT NOT NULL
             );
         """)
+        bootstrap_catalog(connection)
         yield connection
     finally:
         connection.close()
+
+
+def bootstrap_catalog(connection):
+    """Seed a fresh database once from a trusted bundled catalog snapshot."""
+    source = os.environ.get("INITIAL_CATALOG_FILE", "").strip()
+    if not source or connection.execute("SELECT 1 FROM catalog_meta WHERE singleton = 1").fetchone():
+        return
+    path = Path(source)
+    if not path.is_absolute():
+        path = Path(__file__).parent / path
+    try:
+        with path.open(encoding="utf-8") as stream:
+            snapshot = json.load(stream)
+        if not isinstance(snapshot, dict):
+            raise ValueError("Catalog snapshot must be an object")
+        for field, limit in {"catalog_version": 100, "filename": 200, "uploaded_at": 100}.items():
+            value = snapshot.get(field)
+            if not isinstance(value, str) or not value or len(value) > limit:
+                raise ValueError(f"Invalid snapshot field: {field}")
+        products = snapshot.get("products")
+        if not isinstance(products, list) or len(products) > MAX_ROWS:
+            raise ValueError("Invalid snapshot product list")
+        seen = set()
+        rows = []
+        for index, product in enumerate(products):
+            if not isinstance(product, dict):
+                raise ValueError("Invalid snapshot product")
+            for field, limit in {"id": 100, "sku": 100, "name": 500, "unit": 50, "price": 40}.items():
+                value = product.get(field)
+                if not isinstance(value, str) or len(value) > limit:
+                    raise ValueError(f"Invalid snapshot product field: {field}")
+            if not product["id"] or not product["name"] or product["id"] in seen:
+                raise ValueError("Missing or duplicate snapshot product ID/name")
+            seen.add(product["id"])
+            rows.append((product["id"], index, product["sku"], product["name"],
+                         product["unit"], parse_price(product["price"])))
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        raise RuntimeError("Не удалось загрузить начальный прайс из INITIAL_CATALOG_FILE.") from error
+    with connection:
+        # A concurrent owner import or another process may have populated the DB while we read JSON.
+        connection.execute("BEGIN IMMEDIATE")
+        if connection.execute("SELECT 1 FROM catalog_meta WHERE singleton = 1").fetchone():
+            return
+        connection.execute("DELETE FROM products")
+        connection.executemany("INSERT INTO products (id, position, sku, name, unit, price) VALUES (?, ?, ?, ?, ?, ?)", rows)
+        connection.execute("INSERT INTO catalog_meta VALUES (1, ?, ?, ?)",
+                           (snapshot["catalog_version"], snapshot["filename"], snapshot["uploaded_at"]))
 
 
 def read_catalog():

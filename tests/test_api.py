@@ -1,11 +1,15 @@
+import base64
 import io
+import json
 import os
 import smtplib
+import sqlite3
 import tempfile
 import unittest
 import zipfile
 import zlib
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 from email import policy
 from email.parser import BytesParser
 from unittest.mock import patch
@@ -41,6 +45,7 @@ class ApiTests(unittest.TestCase):
         self.data = tempfile.TemporaryDirectory()
         self.environment = patch.dict(os.environ, {
             "DATA_DIR": self.data.name,
+            "INITIAL_CATALOG_FILE": "",
             "ADMIN_TOKEN": "test-owner-password",
             "SMTP_HOST": "", "SMTP_FROM": "", "SMTP_USER": "",
             "SMTP_PASSWORD": "", "SMTP_PORT": "587",
@@ -89,6 +94,81 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(stored["products"], catalog["products"])
         self.assertEqual(stored["catalog_version"], catalog["catalog_version"])
         self.assertTrue(stored["uploaded_at"])
+
+    def initial_snapshot(self):
+        snapshot = {"catalog_version": "published-price-v1", "filename": "Прайс.xlsx",
+                    "uploaded_at": "2026-10-04T08:00:00+00:00",
+                    "products": [{"id": "published-price-v1:1", "sku": "A-1", "name": "Товар из прайса",
+                                  "unit": "шт", "price": "283.50"}]}
+        path = os.path.join(self.data.name, "initial-catalog.json")
+        with open(path, "w", encoding="utf-8") as stream:
+            json.dump(snapshot, stream, ensure_ascii=False)
+        return path, snapshot
+
+    def test_fresh_database_bootstraps_snapshot_and_retains_version_and_ids(self):
+        path, snapshot = self.initial_snapshot()
+        with patch.dict(os.environ, {"INITIAL_CATALOG_FILE": path}):
+            response = self.client.get("/api/catalog")
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json(), snapshot)
+            order = self.order(snapshot)
+            exported = self.client.post("/api/orders/export", json=order)
+            self.assertEqual(exported.status_code, 200, exported.text)
+            sheet = load_workbook(io.BytesIO(exported.content)).active
+            self.assertEqual(sheet["A3"].value, "Товар из прайса")
+            self.assertEqual(sheet["E3"].value, 425.25)
+        # Once persisted, the bundled snapshot is no longer needed to read the catalog.
+        os.remove(path)
+        self.assertEqual(self.client.get("/api/catalog").json(), snapshot)
+
+    def test_bootstrap_never_overwrites_owner_import_even_after_restart(self):
+        path, snapshot = self.initial_snapshot()
+        with patch.dict(os.environ, {"INITIAL_CATALOG_FILE": path}):
+            self.assertEqual(self.client.get("/api/catalog").json(), snapshot)
+            imported = self.upload().json()
+            self.assertNotEqual(imported["catalog_version"], snapshot["catalog_version"])
+            with TestClient(app) as restarted:
+                stored = restarted.get("/api/catalog").json()
+            self.assertEqual(stored["products"], imported["products"])
+            self.assertEqual(stored["catalog_version"], imported["catalog_version"])
+            # An existing catalog bypasses even an absent snapshot file.
+            os.remove(path)
+            self.assertEqual(self.client.get("/api/catalog").json(), stored)
+
+    def test_bootstrap_does_not_replace_catalog_imported_before_configuration(self):
+        imported = self.upload().json()
+        path, _ = self.initial_snapshot()
+        with patch.dict(os.environ, {"INITIAL_CATALOG_FILE": path}):
+            stored = self.client.get("/api/catalog").json()
+        self.assertEqual(stored["catalog_version"], imported["catalog_version"])
+        self.assertEqual(stored["products"], imported["products"])
+
+    def test_invalid_bootstrap_is_atomic_and_can_be_repaired(self):
+        path, snapshot = self.initial_snapshot()
+        invalid = json.loads(json.dumps(snapshot))
+        invalid["products"].append({**snapshot["products"][0], "id": "published-price-v1:2", "price": "NaN"})
+        with open(path, "w", encoding="utf-8") as stream:
+            json.dump(invalid, stream)
+        with patch.dict(os.environ, {"INITIAL_CATALOG_FILE": path}):
+            with self.assertRaises(RuntimeError):
+                self.client.get("/api/catalog")
+            with sqlite3.connect(os.path.join(self.data.name, "catalog.sqlite3")) as connection:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM products").fetchone()[0], 0)
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM catalog_meta").fetchone()[0], 0)
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump(snapshot, stream, ensure_ascii=False)
+            self.assertEqual(self.client.get("/api/catalog").json(), snapshot)
+
+    def test_concurrent_first_requests_seed_once_without_duplicate_products(self):
+        path, snapshot = self.initial_snapshot()
+        def fetch_catalog(_):
+            with TestClient(app) as client:
+                response = client.get("/api/catalog")
+                self.assertEqual(response.status_code, 200, response.text)
+                return response.json()
+        with patch.dict(os.environ, {"INITIAL_CATALOG_FILE": path}), ThreadPoolExecutor(max_workers=4) as executor:
+            responses = list(executor.map(fetch_catalog, range(4)))
+        self.assertEqual(responses, [snapshot] * 4)
 
     def test_import_requires_configured_owner_secret(self):
         self.assertEqual(self.upload(password="wrong").status_code, 401)
@@ -275,4 +355,3 @@ class ApiTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-import base64
