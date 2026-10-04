@@ -22,7 +22,7 @@ from typing import Any
 
 import xlrd
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException, UploadFile
+from fastapi import FastAPI, Header, HTTPException, Query, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -31,6 +31,8 @@ from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.styles import Alignment, Font, PatternFill
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.datastructures import Headers
+
+import account_store
 
 load_dotenv(Path(__file__).with_name(".env"))
 logger = logging.getLogger(__name__)
@@ -43,6 +45,16 @@ HEADER_SCAN_ROWS = 50
 CENT = Decimal("0.01")
 MAX_ORDER_TOTAL = Decimal("999999999999.99")
 MIME_XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+CATALOG_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS catalog_meta (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        version TEXT NOT NULL, filename TEXT NOT NULL, uploaded_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS products (
+        id TEXT PRIMARY KEY, position INTEGER NOT NULL, sku TEXT NOT NULL,
+        name TEXT NOT NULL, unit TEXT NOT NULL, price TEXT NOT NULL
+    );
+"""
 
 
 class CatalogUploadGuard:
@@ -97,21 +109,26 @@ app.add_middleware(CatalogUploadGuard)
 
 @contextmanager
 def database():
+    if account_store.postgres_configured():
+        try:
+            with account_store.postgres_database() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.executescript(CATALOG_SCHEMA)
+                connection.commit()
+                bootstrap_catalog(connection)
+                yield connection
+        except HTTPException:
+            raise
+        except Exception as error:
+            logger.warning("Persistent catalog unavailable (%s)", type(error).__name__)
+            raise HTTPException(503, "Постоянная база каталога временно недоступна.") from None
+        return
     directory = Path(os.environ.get("DATA_DIR", str(Path(__file__).with_name("data"))))
     directory.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(directory / "catalog.sqlite3", timeout=20)
     connection.row_factory = sqlite3.Row
     try:
-        connection.executescript("""
-            CREATE TABLE IF NOT EXISTS catalog_meta (
-                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                version TEXT NOT NULL, filename TEXT NOT NULL, uploaded_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS products (
-                id TEXT PRIMARY KEY, position INTEGER NOT NULL, sku TEXT NOT NULL,
-                name TEXT NOT NULL, unit TEXT NOT NULL, price TEXT NOT NULL
-            );
-        """)
+        connection.executescript(CATALOG_SCHEMA)
         bootstrap_catalog(connection)
         yield connection
     finally:
@@ -315,7 +332,9 @@ def save_catalog(content, extension, filename):
         connection.executemany("INSERT INTO products (id, position, sku, name, unit, price) VALUES (?, ?, ?, ?, ?, ?)",
                                [(p["id"], index, p["sku"], p["name"], p["unit"], p["price"])
                                 for index, p in enumerate(products)])
-        connection.execute("INSERT OR REPLACE INTO catalog_meta VALUES (1, ?, ?, ?)", (version, filename, uploaded_at))
+        connection.execute("""INSERT INTO catalog_meta VALUES (1, ?, ?, ?)
+            ON CONFLICT (singleton) DO UPDATE SET version = excluded.version,
+            filename = excluded.filename, uploaded_at = excluded.uploaded_at""", (version, filename, uploaded_at))
         connection.commit()
     return {"catalog_version": version, "filename": filename, "uploaded_at": uploaded_at,
             "products": products, "imported_count": len(products), "skipped_count": skipped}
@@ -474,17 +493,52 @@ def build_order_excel(order, selected, total, order_id, created_at):
 def order_document(order):
     selected, total = prepare_order(order)
     created_at = datetime.now(timezone.utc)
-    order_id = created_at.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(3)
+    order_id = created_at.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(8)
     filename = f"order-{created_at.strftime('%Y%m%d-%H%M%S')}.xlsx"
     document = build_order_excel(order, selected, total, order_id, created_at)
-    return document, filename, order_id, total
+    return document, filename, order_id, total, selected, created_at
+
+
+def storage_call(function, *args):
+    try:
+        return function(*args)
+    except account_store.DuplicateAccount:
+        raise HTTPException(409, "Аккаунт с этим e-mail уже существует. Войдите с паролем.") from None
+    except Exception as error:
+        logger.warning("Account storage unavailable (%s)", type(error).__name__)
+        raise HTTPException(503, "Постоянная история заказов временно недоступна. Попробуйте позже.") from None
+
+
+def require_account(request):
+    if not account_store.available():
+        raise HTTPException(503, "Аккаунты и постоянная история заказов ещё не настроены.")
+    user = storage_call(account_store.user_for_session, request.cookies.get("okunev_session"))
+    if user is None:
+        raise HTTPException(401, "Войдите в аккаунт, чтобы оформить заказ и открыть историю.")
+    return user
+
+
+def checkout_account(request):
+    return require_account(request) if account_store.available() else None
+
+
+def remember_order(user, order, document, filename, order_id, total, selected, created_at, status):
+    if user is None:
+        return
+    positions = [{"name": product["name"], "unit": product["unit"], "price": product["price"],
+                  "quantity": product["quantity"], "line_total": str(product["line_total"])} for product in selected]
+    storage_call(account_store.save_order, user["id"], order_id, created_at.isoformat(), filename,
+                 status, str(total), positions, order.customer.model_dump(), document)
 
 
 @app.post("/api/orders/export")
-def export_order(order: OrderRequest):
-    document, filename, _, _ = order_document(order)
+def export_order(order: OrderRequest, request: Request):
+    user = checkout_account(request)
+    document, filename, order_id, total, selected, created_at = order_document(order)
+    remember_order(user, order, document, filename, order_id, total, selected, created_at, "exported")
     return Response(document, media_type=MIME_XLSX,
-                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"', "X-Order-Id": order_id,
+                             "X-Order-Saved": "true" if user else "false"})
 
 
 def valid_email(value):
@@ -518,14 +572,18 @@ def mail_settings():
 @app.get("/api/config")
 def config():
     return {"mail_ready": mail_settings() is not None,
+            "history_ready": account_store.available(),
             "upload_requires_password": True, "upload_enabled": bool(os.environ.get("ADMIN_TOKEN", "")),
             "max_upload_mb": MAX_UPLOAD_BYTES // (1024 * 1024)}
 
 
 @app.post("/api/orders/send")
-def send_order(order: OrderRequest):
-    document, filename, order_id, total = order_document(order)
+def send_order(order: OrderRequest, request: Request):
+    user = checkout_account(request)
+    document, filename, order_id, total, selected, created_at = order_document(order)
     settings = mail_settings()
+    remember_order(user, order, document, filename, order_id, total, selected, created_at,
+                   "pending" if settings else "failed")
     if settings is None:
         raise HTTPException(503, "Отправка на почту ещё не настроена. Скачайте Excel-заказ или обратитесь к владельцу.")
     message = EmailMessage()
@@ -552,9 +610,93 @@ def send_order(order: OrderRequest):
             if refused:
                 raise smtplib.SMTPRecipientsRefused(refused)
     except (smtplib.SMTPException, OSError, TimeoutError, ssl.SSLError) as error:
+        if user:
+            storage_call(account_store.update_order_status, user["id"], order_id, "failed")
         logger.warning("Order email failed (%s), order_id=%s", type(error).__name__, order_id)
         raise HTTPException(502, "Не удалось отправить письмо. Заказ сохранён в корзине. Попробуйте позже или скачайте Excel.") from error
+    if user:
+        storage_call(account_store.update_order_status, user["id"], order_id, "sent")
     return {"ok": True, "order_id": order_id}
+
+
+class AccountCredentials(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=8, max_length=128)
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, value):
+        value = value.strip().casefold()
+        if not re.fullmatch(r"[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+", value):
+            raise ValueError("Укажите корректный e-mail.")
+        return value
+
+
+def session_secure(request):
+    setting = os.environ.get("SESSION_COOKIE_SECURE", "").strip().lower()
+    return setting in {"1", "true", "yes"} if setting else request.url.scheme == "https"
+
+
+def account_response(request, user, token):
+    response = JSONResponse({"available": True, "user": user})
+    response.headers["Cache-Control"] = "no-store"
+    response.set_cookie("okunev_session", token, max_age=account_store.SESSION_SECONDS,
+                        httponly=True, secure=session_secure(request), samesite="lax", path="/")
+    return response
+
+
+@app.get("/api/accounts/me")
+def account_me(request: Request):
+    available = account_store.available()
+    user = storage_call(account_store.user_for_session, request.cookies.get("okunev_session")) if available else None
+    return JSONResponse({"available": available, "user": user}, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/accounts/register")
+def register_account(credentials: AccountCredentials, request: Request):
+    if not account_store.available():
+        raise HTTPException(503, "Аккаунты и постоянная история заказов ещё не настроены.")
+    user, token = storage_call(account_store.register, credentials.email, credentials.password)
+    return account_response(request, user, token)
+
+
+@app.post("/api/accounts/login")
+def login_account(credentials: AccountCredentials, request: Request):
+    if not account_store.available():
+        raise HTTPException(503, "Аккаунты и постоянная история заказов ещё не настроены.")
+    result = storage_call(account_store.login, credentials.email, credentials.password)
+    if result is None:
+        raise HTTPException(401, "Неверный e-mail или пароль.")
+    return account_response(request, *result)
+
+
+@app.post("/api/accounts/logout")
+def logout_account(request: Request):
+    if account_store.available():
+        storage_call(account_store.logout, request.cookies.get("okunev_session"))
+    response = JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
+    response.delete_cookie("okunev_session", path="/", httponly=True,
+                           secure=session_secure(request), samesite="lax")
+    return response
+
+
+@app.get("/api/orders/history")
+def order_history(request: Request, offset: int = Query(default=0, ge=0), limit: int = Query(default=50, ge=1, le=100)):
+    user = require_account(request)
+    return JSONResponse(storage_call(account_store.history, user["id"], offset, limit),
+                        headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/orders/history/{order_id}/file")
+def order_history_file(order_id: str, request: Request):
+    user = require_account(request)
+    result = storage_call(account_store.order_file, user["id"], order_id)
+    if result is None:
+        raise HTTPException(404, "Заказ не найден.")
+    filename, document = result
+    return Response(document, media_type=MIME_XLSX,
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"', "Cache-Control": "no-store"})
 
 
 # API routes take precedence over the frontend's static files.

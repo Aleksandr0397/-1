@@ -5,13 +5,13 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Окунев: поиск товаров по прайс-листу, корзина и заказ в Excel.">
   <meta name="theme-color" content="#153db9">
-  <title>Окунев — заказ по прайс-листу</title>
+  <title>Корзина — Окунев</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%23153db9'/%3E%3Ctext x='32' y='47' text-anchor='middle' font-size='46' font-family='Arial' font-weight='bold' fill='white'%3EО%3C/text%3E%3C/svg%3E">
   <link rel="stylesheet" href="/styles.css">
   <script src="/app.js" defer></script>
 </head>
-<body>
-  <a class="skip-link" href="#search">Перейти к поиску товаров</a>
+<body class="full-cart" data-view="cart">
+  <a class="skip-link" href="#order-heading">Перейти к заказу</a>
   <header class="site-header">
     <div class="header-inner">
       <a class="brand" href="/" aria-label="Окунев — главная">
@@ -30,7 +30,7 @@
     </div>
   </header>
 
-  <main class="workspace">
+  <main class="workspace cart-open">
     <section class="catalog-section" aria-labelledby="catalog-heading">
       <div class="section-heading">
         <div><span class="eyebrow">Прайс-лист</span><h1 id="catalog-heading">Выберите товары</h1></div>
@@ -60,9 +60,9 @@
       </div>
     </section>
 
-    <aside class="order-panel" id="order-panel" aria-labelledby="order-heading" hidden>
-      <div class="order-heading"><h2 id="order-heading" tabindex="-1">Ваш заказ</h2><span class="order-count" id="order-count">0</span><button class="icon-button" id="close-cart" type="button" aria-label="Скрыть корзину">×</button></div>
-      <p class="cart-page-link"><a href="/cart/">Открыть корзину полностью →</a></p>
+    <aside class="order-panel" id="order-panel" aria-labelledby="order-heading">
+      <div class="order-heading"><h1 id="order-heading" tabindex="-1">Ваш заказ</h1><span class="order-count" id="order-count">0</span><button class="icon-button" id="close-cart" type="button" aria-label="Скрыть корзину">×</button></div>
+      <p class="cart-page-link"><a href="/">← Вернуться к каталогу</a></p>
       <p class="cart-empty" id="cart-empty">Добавьте товары из прайс-листа — здесь появится ваш заказ.</p>
       <ul class="cart-list" id="cart-items" aria-label="Товары в заказе"></ul>
       <div class="order-total"><span>Итого</span><strong id="total">0 ₽</strong></div>

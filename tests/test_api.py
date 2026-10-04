@@ -46,6 +46,7 @@ class ApiTests(unittest.TestCase):
         self.environment = patch.dict(os.environ, {
             "DATA_DIR": self.data.name,
             "INITIAL_CATALOG_FILE": "",
+            "ORDERS_DATABASE_URL": "", "ORDERS_HISTORY_DIR": "",
             "ADMIN_TOKEN": "test-owner-password",
             "SMTP_HOST": "", "SMTP_FROM": "", "SMTP_USER": "",
             "SMTP_PASSWORD": "", "SMTP_PORT": "587",
@@ -78,6 +79,7 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(config["upload_enabled"])
         self.assertTrue(config["upload_requires_password"])
         self.assertFalse(config["mail_ready"])
+        self.assertFalse(config["history_ready"])
         self.assertEqual(config["max_upload_mb"], 10)
 
     def test_import_detects_title_and_cyrillic_headers_and_persists(self):
@@ -363,6 +365,7 @@ class ApiTests(unittest.TestCase):
         attachments = list(parsed.iter_attachments())
         self.assertEqual(len(attachments), 1)
         self.assertTrue(attachments[0].get_filename().endswith(".xlsx"))
+        self.assertEqual(set(response.json()), {"ok", "order_id"})
         sheet = load_workbook(io.BytesIO(attachments[0].get_payload(decode=True))).active
         values = [cell.value for row in sheet for cell in row]
         self.assertIn("Кабель медный Ёлка", values)

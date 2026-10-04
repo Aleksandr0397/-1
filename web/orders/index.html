@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Мои заказы — Окунев</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/orders.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#orders-heading">Перейти к заказам</a>
+  <header class="site-header"><div class="header-inner">
+    <a class="brand" href="/" aria-label="Окунев — главная"><span class="brand-mark" aria-hidden="true">О</span><span><strong>Окунев</strong><span class="brand-caption">Заказ по прайс-листу</span></span></a>
+    <div class="header-actions"><a class="button button-outline" href="/cart/">Корзина</a><a class="button button-quiet" href="/">Каталог</a><a class="button button-quiet" href="/orders/" aria-current="page">Заказы</a></div>
+  </div></header>
+  <main class="workspace history-workspace">
+    <section aria-labelledby="orders-heading">
+      <div class="section-heading"><div><span class="eyebrow">Личный список</span><h1 id="orders-heading" tabindex="-1">Мои заказы</h1></div></div>
+      <p class="history-intro">Здесь остаются ваши готовые заказы с датой, выбранными товарами и исходным Excel-файлом. Каждый пользователь видит свои заказы.</p>
+      <div class="feedback" id="history-feedback" role="status">Проверяем доступ к истории…</div>
+      <section class="account-card" id="account-card" aria-labelledby="account-heading" hidden>
+        <h2 id="account-heading">Войдите в свой аккаунт</h2>
+        <div class="auth-tabs"><button class="button button-primary" id="auth-login" type="button" aria-pressed="true">Вход</button><button class="button button-quiet" id="auth-register" type="button" aria-pressed="false">Регистрация</button></div>
+        <form id="account-form">
+          <label for="account-email">Электронная почта</label><input id="account-email" type="email" maxlength="254" autocomplete="username" required>
+          <label for="account-password">Пароль</label><input id="account-password" type="password" minlength="8" maxlength="128" autocomplete="current-password" required>
+          <p class="format-hint">При регистрации придумайте пароль от 8 символов.</p>
+          <button class="button button-primary" id="account-submit" type="submit">Войти</button>
+        </form>
+      </section>
+      <div class="account-bar" id="account-bar" hidden><span id="account-user"></span><button class="button button-quiet" id="account-logout" type="button">Выйти</button></div>
+      <p class="cart-empty" id="history-empty" hidden>Заказов пока нет. <a href="/">Выберите товары</a> и скачайте заказ в Excel — он сохранится здесь.</p>
+      <div class="history-list" id="history-list"></div>
+      <button class="button button-outline" id="history-more" type="button" hidden>Показать ещё</button>
+    </section>
+  </main>
+  <footer class="site-footer"><span>Окунев</span><span>Поиск. Выбор. Заказ.</span></footer>
+</body>
+</html>

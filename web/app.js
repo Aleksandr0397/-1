@@ -1,8 +1,9 @@
 'use strict';
 
 const byId = (id) => document.getElementById(id);
-const state = { config: null, catalog: { catalog_version: null, products: [] }, products: new Map(), indexed: [], cart: new Map(), shown: 60, filtered: [], busy: false, sentSignature: null };
+const state = { config: null, user: null, catalog: { catalog_version: null, products: [] }, products: new Map(), indexed: [], cart: new Map(), shown: 60, filtered: [], busy: false, sentSignature: null };
 const storageKey = 'okunev-order-cart-v1';
+const fullCart = document.body.dataset.view === 'cart';
 const money = new Intl.NumberFormat('ru-RU', { style: 'currency', currency: 'RUB', minimumFractionDigits: 0, maximumFractionDigits: 2 });
 const wholeNumbers = new Intl.NumberFormat('ru-RU');
 let toastTimer;
@@ -45,12 +46,16 @@ async function jsonApi(url, options) {
   return response.json();
 }
 function saveCart() {
-  try { localStorage.setItem(storageKey, JSON.stringify({ catalog_version: state.catalog.catalog_version, items: Array.from(state.cart, ([product_id, quantity]) => ({ product_id, quantity })) })); } catch (_) { /* The basket still works when browser storage is unavailable. */ }
+  try { localStorage.setItem(storageKey, JSON.stringify({ catalog_version: state.catalog.catalog_version, customer: customerFields(), items: Array.from(state.cart, ([product_id, quantity]) => ({ product_id, quantity })) })); } catch (_) { /* The basket still works when browser storage is unavailable. */ }
 }
 function restoreCart() {
   try {
     const saved = JSON.parse(localStorage.getItem(storageKey) || 'null');
     if (!saved) return;
+    for (const field of ['name', 'contact', 'comment']) {
+      const input = byId('customer-' + field);
+      if (typeof saved.customer?.[field] === 'string') input.value = saved.customer[field].slice(0, input.maxLength);
+    }
     if (saved.catalog_version !== state.catalog.catalog_version) {
       localStorage.removeItem(storageKey);
       if (saved.items?.length) notify('Прайс обновился. Соберите заказ по новым ценам.');
@@ -144,6 +149,20 @@ function formatCents(cents) {
   const remainder = cents % 100n;
   return wholeNumbers.format(cents / 100n) + (remainder ? ',' + String(remainder).padStart(2, '0') : '') + ' ₽';
 }
+function setCartOpen(open, scroll = false) {
+  if (fullCart) return;
+  byId('order-panel').hidden = !open;
+  document.querySelector('.workspace').classList.toggle('cart-open', open);
+  byId('toggle-cart').setAttribute('aria-expanded', String(open));
+  byId('jump-to-order').setAttribute('aria-expanded', String(open));
+  byId('jump-to-order').textContent = open ? 'Скрыть заказ' : 'Открыть заказ';
+  if (open && scroll) {
+    byId('order-panel').scrollIntoView({ behavior: 'auto', block: 'start' });
+    byId('order-heading').focus({ preventScroll: true });
+  } else if (!open) {
+    byId('toggle-cart').focus({ preventScroll: true });
+  }
+}
 function renderCart() {
   const fragment = document.createDocumentFragment();
   let totalCents = 0n;
@@ -172,6 +191,7 @@ function renderCart() {
   byId('cart-empty').hidden = state.cart.size > 0;
   byId('clear-cart').hidden = !state.cart.size;
   byId('order-count').textContent = state.cart.size;
+  byId('header-cart-count').textContent = state.cart.size;
   byId('total').textContent = formatCents(totalCents);
   byId('mobile-total').textContent = formatCents(totalCents);
   byId('mobile-count').textContent = plural(state.cart.size);
@@ -179,13 +199,17 @@ function renderCart() {
   document.body.classList.toggle('has-cart', state.cart.size > 0);
   updateActions();
 }
+function customerFields() {
+  return { name: byId('customer-name').value.trim(), contact: byId('customer-contact').value.trim(), comment: byId('customer-comment').value.trim() };
+}
 function orderPayload() {
-  return { catalog_version: state.catalog.catalog_version, customer: { name: byId('customer-name').value.trim(), contact: byId('customer-contact').value.trim(), comment: byId('customer-comment').value.trim() }, items: Array.from(state.cart, ([product_id, quantity]) => ({ product_id, quantity: String(quantity) })) };
+  return { catalog_version: state.catalog.catalog_version, customer: customerFields(), items: Array.from(state.cart, ([product_id, quantity]) => ({ product_id, quantity: String(quantity) })) };
 }
 function updateActions() {
   const sent = state.sentSignature && state.sentSignature === JSON.stringify(orderPayload());
-  byId('download-order').disabled = state.busy || !state.cart.size;
-  byId('send-order').disabled = state.busy || !state.cart.size || !state.config?.mail_ready || Boolean(sent);
+  const needsLogin = state.config?.history_ready && !state.user;
+  byId('download-order').disabled = state.busy || !state.cart.size || needsLogin;
+  byId('send-order').disabled = state.busy || !state.cart.size || needsLogin || !state.config?.mail_ready || Boolean(sent);
   byId('send-order').textContent = state.busy ? 'Подождите…' : sent ? 'Заказ отправлен' : 'Отправить заказ';
 }
 async function checkout(send) {
@@ -195,8 +219,9 @@ async function checkout(send) {
     const response = await fetch('/api/orders/' + (send ? 'send' : 'export'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
     if (!response.ok) throw await errorFor(response);
     if (send) {
-      await response.json(); state.sentSignature = JSON.stringify(payload);
-      feedback('order-feedback', 'Заказ отправлен. Excel-файл с выбранными товарами приложен к письму.');
+      await response.json();
+      state.sentSignature = JSON.stringify(payload);
+      feedback('order-feedback', 'Заказ отправлен. Excel-файл с выбранными товарами приложен к письму.' + (state.config?.history_ready ? ' Заказ сохранён в разделе «Заказы».' : ''));
     } else {
       const blob = await response.blob();
       const url = URL.createObjectURL(blob);
@@ -205,7 +230,7 @@ async function checkout(send) {
       const filename = disposition.match(/filename="?([^";]+)"?/i);
       link.href = url; link.download = filename ? filename[1] : 'Заказ.xlsx';
       document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 10000);
-      notify('Excel-заказ подготовлен для скачивания.');
+      notify(response.headers.get('X-Order-Saved') === 'true' ? 'Excel готов. Заказ сохранён в разделе «Заказы».' : 'Excel-заказ подготовлен для скачивания.');
     }
   } catch (error) {
     feedback('order-feedback', error.message || 'Нет связи с сайтом. Попробуйте ещё раз.', true);
@@ -246,10 +271,17 @@ async function loadCatalog(restore) {
   }
 }
 async function start() {
-  const configTask = jsonApi('/api/config').then((config) => {
+  const configTask = jsonApi('/api/config').then(async (config) => {
     state.config = config;
     byId('mail-note').textContent = config.mail_ready ? 'Заказ отправится поставщику по e-mail с Excel-вложением.' : 'Отправка почты пока не подключена. Готовый заказ можно скачать в Excel.';
     byId('admin-password').required = config.upload_requires_password;
+    const note = byId('history-note');
+    if (config.history_ready) {
+      try { state.user = (await jsonApi('/api/accounts/me')).user; } catch (_) { state.user = null; }
+      note.textContent = state.user ? 'Готовые заказы сохраняются в вашем личном списке.' : 'Войдите, чтобы оформлять и сохранять заказы: ';
+      const link = node('a', '', state.user ? 'Мои заказы' : 'Вход и регистрация'); link.href = '/orders/';
+      note.append(document.createTextNode(' '), link);
+    } else note.textContent = 'Сохранение истории на сервере пока не подключено. Excel-заказ можно скачать.';
     updateActions();
   }).catch(() => { byId('mail-note').textContent = 'Отправка временно недоступна. Готовый заказ можно скачать в Excel.'; });
   await Promise.allSettled([configTask, loadCatalog(true)]);
@@ -258,7 +290,7 @@ async function start() {
 byId('search').addEventListener('input', () => { clearTimeout(searchTimer); searchTimer = setTimeout(filterProducts, 60); });
 byId('load-more').addEventListener('click', () => { state.shown += 60; renderProducts(); });
 byId('clear-cart').addEventListener('click', () => { state.cart.clear(); basketChanged(); renderCart(); });
-byId('customer-form').addEventListener('input', () => { state.sentSignature = null; updateActions(); });
+byId('customer-form').addEventListener('input', () => { state.sentSignature = null; saveCart(); updateActions(); });
 byId('customer-form').addEventListener('submit', (event) => event.preventDefault());
 byId('send-order').addEventListener('click', () => checkout(true));
 byId('download-order').addEventListener('click', () => checkout(false));
@@ -269,5 +301,8 @@ byId('upload-dialog').addEventListener('cancel', () => { byId('admin-password').
 byId('upload-form').addEventListener('submit', upload);
 byId('price-file').addEventListener('change', () => { byId('selected-file').textContent = byId('price-file').files[0]?.name || 'Файл не выбран'; });
 byId('retry-load').addEventListener('click', () => loadCatalog(false));
-byId('jump-to-order').addEventListener('click', () => { byId('order-panel').scrollIntoView({ behavior: 'auto', block: 'start' }); byId('order-heading').focus({ preventScroll: true }); });
+byId('toggle-cart').addEventListener('click', () => setCartOpen(byId('order-panel').hidden, window.matchMedia('(max-width: 900px)').matches));
+byId('close-cart').addEventListener('click', () => setCartOpen(false));
+byId('jump-to-order').addEventListener('click', () => setCartOpen(byId('order-panel').hidden, true));
+byId('order-panel').addEventListener('keydown', (event) => { if (event.key === 'Escape') { event.preventDefault(); setCartOpen(false); } });
 start();

@@ -8,3 +8,49 @@
 @media(min-width:901px){.order-panel{max-height:calc(100dvh - 48px);overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin}}
 @media(max-width:900px){body.has-cart{padding-bottom:96px}.mobile-order-bar{display:flex;position:fixed;bottom:max(14px,env(safe-area-inset-bottom));left:16px;right:16px;background:var(--blue);color:white;border-radius:12px;padding:12px 15px;justify-content:space-between;align-items:center;gap:12px;z-index:15;box-shadow:0 5px 24px #10214230}.mobile-order-bar>span{display:grid;min-width:0}.mobile-order-bar strong{font-size:1.125rem;overflow-wrap:anywhere}.mobile-order-bar>span>span{font-size:.875rem;color:#e4ebff}.mobile-order-bar .button{background:white;color:var(--blue);white-space:nowrap}.toast{bottom:105px}}
 @media(prefers-reduced-motion:reduce){*{transition:none!important;scroll-behavior:auto!important}}
+
+/* The order panel opens only when the buyer requests it. */
+.workspace:not(.cart-open){grid-template-columns:minmax(0,1fr)}
+.header-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px}
+.header-cart-count{display:grid;place-items:center;min-width:24px;min-height:24px;padding:1px 6px;border-radius:6px;background:var(--blue);color:white;font-size:.75rem;font-variant-numeric:tabular-nums}
+.cart-arrow{font-size:1.25rem;line-height:1;transition:transform .15s}
+#toggle-cart[aria-expanded="true"] .cart-arrow{transform:rotate(180deg)}
+.order-heading #close-cart{margin-left:auto;flex-shrink:0}
+@media(max-width:620px){.header-inner{flex-wrap:wrap}.header-actions{width:100%;justify-content:space-between}.header-actions .button{min-width:0;flex:1;padding:9px 8px;font-size:.875rem}}
+
+.header-actions{flex-wrap:wrap}
+.cart-nav{display:inline-flex;align-items:stretch}
+.cart-nav #cart-link{border-radius:9px 0 0 9px;text-decoration:none}
+.cart-nav #toggle-cart{border-radius:0 9px 9px 0;border-left:0;min-width:40px;padding:10px}
+.header-actions>a{text-decoration:none;white-space:nowrap}
+.cart-page-link{margin:8px 0 18px;font-size:.875rem;color:var(--blue)}
+.full-cart .catalog-section,.full-cart #toggle-cart,.full-cart #close-cart,.full-cart .mobile-order-bar{display:none}
+.full-cart .workspace,.history-workspace{grid-template-columns:minmax(0,1fr)}
+.full-cart .order-panel{position:static;max-height:none;overflow:visible;width:100%}
+.full-cart .cart-list{max-height:none;overflow:visible}
+.full-cart .customer-form{max-width:680px;margin-top:24px}
+.full-cart .order-actions{grid-template-columns:1fr 1fr;max-width:680px}
+.full-cart .order-note{text-align:left}
+.full-cart .cart-item{padding:20px 0}
+.full-cart .cart-line-total{margin-left:auto}
+.full-cart .cart-controls{justify-content:space-between}
+.full-cart #cart-link{border-radius:9px}
+.history-intro{color:var(--muted);margin-bottom:20px;max-width:850px}
+.account-card{max-width:520px;background:white;padding:24px;border:1px solid var(--line);border-radius:var(--radius);margin-top:22px}
+.auth-tabs{display:flex;gap:8px;margin:16px 0}
+.account-card label{display:block;margin:12px 0 7px;font-size:.875rem;font-weight:600}
+.account-card #account-submit{width:100%}
+.account-bar{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin:20px 0;overflow-wrap:anywhere}
+.history-list{display:grid;gap:18px;margin-top:20px}
+.history-card{background:white;border:1px solid var(--line);border-radius:var(--radius);padding:24px;min-width:0}
+.history-card-heading{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px}
+.history-card-heading h2{font-size:1.125rem}
+.history-status{color:var(--muted);font-size:.875rem;margin:10px 0}
+.history-card summary{cursor:pointer;color:var(--blue);margin:12px 0}
+.history-positions{list-style:none;padding:0;margin:0 0 16px}
+.history-positions li{display:flex;justify-content:space-between;gap:18px;border-top:1px solid var(--line);padding:12px 0;overflow-wrap:anywhere}
+.history-positions li span:first-child{min-width:0}
+.history-positions li span:last-child{flex-shrink:0;text-align:right}
+.history-card .button{margin-top:10px}
+#history-more{margin-top:20px}
+@media(max-width:620px){.header-actions .cart-nav{flex:1}.header-actions .cart-nav #cart-link{flex:1}.header-actions .cart-nav #toggle-cart{flex:0 0 40px}.full-cart .order-actions{grid-template-columns:1fr}.history-card,.account-card{padding:20px}.history-positions li{flex-direction:column;gap:6px}.history-positions li span:last-child{text-align:left}}
