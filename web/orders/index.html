@@ -34,6 +34,13 @@
       <button class="button button-outline" id="history-more" type="button" hidden>Показать ещё</button>
     </section>
   </main>
+  <dialog class="upload-dialog" id="delete-order-dialog" aria-labelledby="delete-order-heading">
+    <div class="dialog-heading"><h2 id="delete-order-heading">Удалить заказ?</h2><button class="icon-button" id="delete-order-close" type="button" aria-label="Оставить заказ и закрыть окно">×</button></div>
+    <p class="delete-order-name" id="delete-order-name"></p>
+    <p class="dialog-description">Заказ и его Excel-файл будут удалены из вашей истории.</p>
+    <div class="feedback" id="delete-order-feedback" role="status" aria-live="polite" hidden></div>
+    <div class="dialog-actions"><button class="button button-outline" id="delete-order-keep" type="button">Сохранить</button><button class="button button-danger" id="delete-order-confirm" type="button">Удалить</button></div>
+  </dialog>
   <footer class="site-footer"><span>Окунев</span><span>Поиск. Выбор. Заказ.</span></footer>
 </body>
 </html>

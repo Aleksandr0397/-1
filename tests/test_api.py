@@ -4,6 +4,8 @@ import json
 import os
 import smtplib
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -185,6 +187,125 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(self.client.get("/api/catalog").json()["catalog_version"], catalog["catalog_version"])
         self.assertEqual(self.upload(filename="price.csv").status_code, 400)
+
+    def test_catalog_version_endpoint_returns_only_public_current_or_archived_snapshot(self):
+        self.assertEqual(self.client.get("/api/catalog/versions/unknown-version").status_code, 404)
+        self.upload()
+        first = self.client.get("/api/catalog").json()
+        current = self.client.get("/api/catalog/versions/" + first["catalog_version"])
+        self.assertEqual(current.status_code, 200, current.text)
+        self.assertEqual(current.json(), first)
+        self.upload(price_file([["NEW", "Товар нового прайса", "шт", "99,50"]]), filename="new-price.xlsx")
+        second = self.client.get("/api/catalog").json()
+        archived = self.client.get("/api/catalog/versions/" + first["catalog_version"])
+        self.assertEqual(archived.status_code, 200, archived.text)
+        self.assertEqual(archived.json(), first)
+        self.assertEqual(set(archived.json()), {"catalog_version", "filename", "uploaded_at", "products"})
+        for product in archived.json()["products"]:
+            self.assertEqual(set(product), {"id", "sku", "name", "unit", "price"})
+        self.assertEqual(self.client.get("/api/catalog/versions/" + second["catalog_version"]).json(), second)
+        self.assertEqual(self.client.get("/api/catalog").json()["products"][0]["name"], "Товар нового прайса")
+        self.assertEqual(self.client.get("/api/catalog/versions/still-unknown").status_code, 404)
+
+    def test_multiple_price_replacements_preserve_exact_ids_names_prices_and_order_for_recovery(self):
+        snapshots = []
+        for index in range(3):
+            self.assertEqual(self.upload(price_file([["SKU", f"Товар {index}", "шт", 10 + index],
+                                                     ["SECOND", f"Вторая позиция {index}", "м", 20 + index]])).status_code, 200)
+            snapshots.append(self.client.get("/api/catalog").json())
+        for snapshot in snapshots:
+            self.assertEqual(self.client.get("/api/catalog/versions/" + snapshot["catalog_version"]).json(), snapshot)
+        self.assertEqual(self.client.get("/api/catalog").json(), snapshots[-1])
+        with sqlite3.connect(os.path.join(self.data.name, "catalog.sqlite3")) as connection:
+            archived_versions = {row[0] for row in connection.execute("SELECT version FROM catalog_archive")}
+            self.assertEqual(archived_versions, {snapshot["catalog_version"] for snapshot in snapshots[:-1]})
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM products").fetchone()[0], 2)
+
+    def test_invalid_price_import_preserves_current_catalog_and_existing_archive(self):
+        self.upload()
+        first = self.client.get("/api/catalog").json()
+        self.upload(price_file([["NEW", "Актуальный товар", "шт", 50]]))
+        current = self.client.get("/api/catalog").json()
+        with sqlite3.connect(os.path.join(self.data.name, "catalog.sqlite3")) as connection:
+            before = connection.execute("SELECT * FROM catalog_archive").fetchall()
+        for invalid in (b"Not an Excel file", price_file([["BAD", "Без корректной цены", "шт", "по запросу"]])):
+            self.assertEqual(self.upload(invalid).status_code, 400)
+        self.assertEqual(self.client.get("/api/catalog").json(), current)
+        self.assertEqual(self.client.get("/api/catalog/versions/" + first["catalog_version"]).json(), first)
+        with sqlite3.connect(os.path.join(self.data.name, "catalog.sqlite3")) as connection:
+            self.assertEqual(connection.execute("SELECT * FROM catalog_archive").fetchall(), before)
+
+    def test_archive_and_replacement_roll_back_together_if_new_product_write_fails(self):
+        self.upload()
+        first = self.client.get("/api/catalog").json()
+        self.upload(price_file([["SECOND", "Второй прайс", "шт", 50]]))
+        current = self.client.get("/api/catalog").json()
+        with sqlite3.connect(os.path.join(self.data.name, "catalog.sqlite3")) as connection:
+            before = connection.execute("SELECT * FROM catalog_archive").fetchall()
+            connection.execute("""CREATE TRIGGER reject_replacement BEFORE INSERT ON products
+                                  BEGIN SELECT RAISE(ABORT, 'injected product write failure'); END""")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.upload(price_file([["THIRD", "Третий прайс", "шт", 75]]))
+        self.assertEqual(self.client.get("/api/catalog").json(), current)
+        self.assertEqual(self.client.get("/api/catalog/versions/" + first["catalog_version"]).json(), first)
+        with sqlite3.connect(os.path.join(self.data.name, "catalog.sqlite3")) as connection:
+            self.assertEqual(connection.execute("SELECT * FROM catalog_archive").fetchall(), before)
+
+    def test_catalog_archive_survives_new_process(self):
+        self.upload()
+        first = self.client.get("/api/catalog").json()
+        self.upload(price_file([["NEW", "Новый прайс", "шт", 99]]))
+        current = self.client.get("/api/catalog").json()
+        code = """
+import json,sys
+from fastapi.testclient import TestClient
+from app import app
+data=json.load(sys.stdin)
+with TestClient(app) as client:
+    archived=client.get('/api/catalog/versions/'+data['old_version'])
+    assert archived.status_code==200
+    print(json.dumps({'archived':archived.json(),'current':client.get('/api/catalog').json()}))
+"""
+        result = subprocess.run([sys.executable, "-c", code], cwd=os.path.dirname(os.path.dirname(__file__)),
+                                input=json.dumps({"old_version": first["catalog_version"]}),
+                                text=True, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"archived": first, "current": current})
+
+    def test_catalog_archive_does_not_change_saved_order_or_accept_old_checkout(self):
+        history_dir = os.path.join(self.data.name, "order-history")
+        with patch.dict(os.environ, {"ORDERS_HISTORY_DIR": history_dir}):
+            registered = self.client.post("/api/accounts/register", json={"email": "archive-buyer@example.com",
+                                                                           "password": "archive-test-long-password"})
+            self.assertEqual(registered.status_code, 200, registered.text)
+            self.upload()
+            first = self.client.get("/api/catalog").json()
+            old_order = self.order(first)
+            exported = self.client.post("/api/orders/export", json=old_order)
+            self.assertEqual(exported.status_code, 200, exported.text)
+            history = self.client.get("/api/orders/history").json()
+            self.upload(price_file([["NEW", "Новый прайс", "шт", 99]]))
+            self.assertEqual(self.client.get("/api/catalog/versions/" + first["catalog_version"]).json(), first)
+            self.assertEqual(self.client.get("/api/orders/history").json(), history)
+            self.assertEqual(self.client.get("/api/orders/history/" + exported.headers["x-order-id"] + "/file").content,
+                             exported.content)
+            self.assertEqual(self.client.post("/api/orders/export", json=old_order).status_code, 409)
+
+    def test_concurrent_price_uploads_archive_every_superseded_public_snapshot(self):
+        self.upload()
+        first = self.client.get("/api/catalog").json()
+        def upload_price(index):
+            with TestClient(app) as client:
+                response = client.post("/api/catalog/import", headers={"X-Admin-Token": "test-owner-password"},
+                                       files={"file": (f"price-{index}.xlsx", price_file([[str(index), f"Товар {index}", "шт", index]]))})
+                self.assertEqual(response.status_code, 200, response.text)
+                return {field: response.json()[field] for field in ("catalog_version", "filename", "uploaded_at", "products")}
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            uploaded = list(workers.map(upload_price, (1, 2)))
+        for snapshot in (first, *uploaded):
+            self.assertEqual(self.client.get("/api/catalog/versions/" + snapshot["catalog_version"]).json(), snapshot)
+        with sqlite3.connect(os.path.join(self.data.name, "catalog.sqlite3")) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM catalog_archive").fetchone()[0], 2)
 
     def test_oversized_body_and_untrusted_body_rejected_before_parsing(self):
         body = b"x" * (10 * 1024 * 1024 + 256 * 1024 + 1)

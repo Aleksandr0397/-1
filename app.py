@@ -54,6 +54,10 @@ CATALOG_SCHEMA = """
         id TEXT PRIMARY KEY, position INTEGER NOT NULL, sku TEXT NOT NULL,
         name TEXT NOT NULL, unit TEXT NOT NULL, price TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS catalog_archive (
+        version TEXT PRIMARY KEY, filename TEXT NOT NULL, uploaded_at TEXT NOT NULL,
+        products_json TEXT NOT NULL
+    );
 """
 
 
@@ -182,10 +186,18 @@ def bootstrap_catalog(connection):
                            (snapshot["catalog_version"], snapshot["filename"], snapshot["uploaded_at"]))
 
 
-def read_catalog():
+def read_catalog(version=None):
     with database() as connection:
         connection.execute("BEGIN")
         meta = connection.execute("SELECT * FROM catalog_meta WHERE singleton = 1").fetchone()
+        if version is not None and (meta is None or meta["version"] != version):
+            archived = connection.execute("""
+                SELECT version, filename, uploaded_at, products_json FROM catalog_archive WHERE version = ?
+            """, (version,)).fetchone()
+            if archived is None:
+                raise HTTPException(404, "Эта версия прайса недоступна.")
+            return {"catalog_version": archived["version"], "filename": archived["filename"],
+                    "uploaded_at": archived["uploaded_at"], "products": json.loads(archived["products_json"])}
         products = connection.execute("SELECT id, sku, name, unit, price FROM products ORDER BY position").fetchall()
     return {
         "catalog_version": meta["version"] if meta else None,
@@ -320,6 +332,18 @@ def parse_workbook(content, extension):
     raise HTTPException(400, "Не найдены товары с заголовками «Наименование» и «Цена». Проверьте столбцы прайса.")
 
 
+def archive_current_catalog(connection):
+    meta = connection.execute("SELECT version, filename, uploaded_at FROM catalog_meta WHERE singleton = 1").fetchone()
+    if meta is None:
+        return
+    products = connection.execute("SELECT id, sku, name, unit, price FROM products ORDER BY position").fetchall()
+    connection.execute("""
+        INSERT INTO catalog_archive (version, filename, uploaded_at, products_json) VALUES (?, ?, ?, ?)
+        ON CONFLICT (version) DO NOTHING
+    """, (meta["version"], meta["filename"], meta["uploaded_at"],
+          json.dumps([dict(product) for product in products], ensure_ascii=False)))
+
+
 def save_catalog(content, extension, filename):
     products, skipped = parse_workbook(content, extension)
     version = str(uuid.uuid4())
@@ -328,6 +352,7 @@ def save_catalog(content, extension, filename):
         product["id"] = f"{version}:{index + 1}"
     with database() as connection:
         connection.execute("BEGIN IMMEDIATE")
+        archive_current_catalog(connection)
         connection.execute("DELETE FROM products")
         connection.executemany("INSERT INTO products (id, position, sku, name, unit, price) VALUES (?, ?, ?, ?, ?, ?)",
                                [(p["id"], index, p["sku"], p["name"], p["unit"], p["price"])
@@ -348,6 +373,11 @@ def health():
 @app.get("/api/catalog")
 def catalog():
     return read_catalog()
+
+
+@app.get("/api/catalog/versions/{version}")
+def catalog_version_snapshot(version: str):
+    return read_catalog(version)
 
 
 @app.post("/api/catalog/import")
@@ -416,7 +446,7 @@ class OrderRequest(BaseModel):
 def prepare_order(order):
     catalog = read_catalog()
     if order.catalog_version != catalog["catalog_version"]:
-        raise HTTPException(409, "Прайс обновился. Обновите каталог и соберите заказ по новым ценам.")
+        raise HTTPException(409, "Прайс обновился. Обновите каталог, проверьте цены и наличие в корзине и повторите оформление.")
     products = {product["id"]: product for product in catalog["products"]}
     selected = []
     seen = set()
@@ -519,7 +549,11 @@ def require_account(request):
 
 
 def checkout_account(request):
-    return require_account(request) if account_store.available() else None
+    user = require_account(request) if account_store.available() else None
+    expected = request.headers.get("x-account-id")
+    if user is not None and expected is not None and expected != user["id"]:
+        raise HTTPException(409, "Аккаунт изменился. Обновите страницу и войдите в нужный аккаунт.")
+    return user
 
 
 def remember_order(user, order, document, filename, order_id, total, selected, created_at, status):
@@ -708,10 +742,22 @@ def logout_account(request: Request):
 
 
 @app.get("/api/orders/history")
-def order_history(request: Request, offset: int = Query(default=0, ge=0), limit: int = Query(default=50, ge=1, le=100)):
+def order_history(request: Request, offset: int = Query(default=0, ge=0), limit: int = Query(default=50, ge=1, le=100), x_account_id: str | None = Header(default=None)):
     user = require_account(request)
+    if x_account_id is not None and x_account_id != user["id"]:
+        raise HTTPException(409, "Аккаунт изменился. Обновите страницу и войдите в нужный аккаунт.")
     return JSONResponse(storage_call(account_store.history, user["id"], offset, limit),
                         headers={"Cache-Control": "no-store"})
+
+
+@app.delete("/api/orders/history/{order_id}")
+def delete_order_history(order_id: str, request: Request, x_account_id: str | None = Header(default=None)):
+    user = require_account(request)
+    if x_account_id is not None and x_account_id != user["id"]:
+        raise HTTPException(409, "Аккаунт изменился. Обновите страницу и войдите в нужный аккаунт.")
+    if not storage_call(account_store.delete_order, user["id"], order_id):
+        raise HTTPException(404, "Заказ не найден.")
+    return JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/orders/history/{order_id}/file")

@@ -199,6 +199,10 @@ with TestClient(app) as client:
         user_b = self.register(self.other, "buyer-b@example.com")
         stale_header = {"X-Account-Id": user_a["id"]}
         self.assertEqual(self.other.get("/api/accounts/profile", headers=stale_header).status_code, 409)
+        self.assertEqual(self.other.get("/api/orders/history", headers=stale_header).status_code, 409)
+        for endpoint in ("/api/orders/export", "/api/orders/send"):
+            self.assertEqual(self.other.post(endpoint, headers=stale_header, json=self.order()).status_code, 409)
+        self.assertEqual(self.other.get("/api/orders/history").json()["total"], 0)
         self.assertEqual(self.other.put("/api/accounts/profile", headers=stale_header, json=profile_a).status_code, 409)
         self.assertEqual(self.other.get("/api/accounts/profile").json(),
                          {"profile": {"email": user_b["email"], **self.profile()}})
@@ -348,6 +352,122 @@ with TestClient(app) as client:
         self.assertEqual({order["id"] for order in first["orders"] + second["orders"]}, ids)
         self.assertEqual(self.client.get("/api/orders/history?limit=101").status_code, 422)
         self.assertEqual(self.client.get("/api/orders/history?offset=-1").status_code, 422)
+
+    def test_delete_saved_order_requires_login_and_configured_storage(self):
+        endpoint = "/api/orders/history/unknown-order"
+        self.assertEqual(self.client.delete(endpoint).status_code, 401)
+        with patch.dict(os.environ, {"ORDERS_HISTORY_DIR": ""}):
+            self.assertEqual(self.client.delete(endpoint).status_code, 503)
+        self.register()
+        self.client.post("/api/accounts/logout")
+        self.assertEqual(self.client.delete(endpoint).status_code, 401)
+
+    def test_nonowner_cannot_delete_saved_order_and_missing_order_is_indistinguishable(self):
+        user_a = self.register()
+        exported_a = self.exported()
+        order_a = exported_a.headers["x-order-id"]
+        user_b = self.register(self.other, "buyer-b@example.com")
+        exported_b = self.exported(self.other, 3)
+        history_a = self.client.get("/api/orders/history").json()
+        history_b = self.other.get("/api/orders/history").json()
+        forbidden = self.other.delete(f"/api/orders/history/{order_a}?user_id={user_a['id']}",
+                                      headers={"X-Account-Id": user_b["id"]})
+        missing = self.other.delete("/api/orders/history/unknown-order")
+        self.assertEqual(forbidden.status_code, 404)
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(forbidden.json(), missing.json())
+        self.assertEqual(self.client.get("/api/orders/history").json(), history_a)
+        self.assertEqual(self.other.get("/api/orders/history").json(), history_b)
+        self.assertEqual(self.client.get(f"/api/orders/history/{order_a}/file").content, exported_a.content)
+        self.assertEqual(self.other.get(f"/api/orders/history/{exported_b.headers['x-order-id']}/file").content,
+                         exported_b.content)
+
+    def test_delete_saved_order_removes_only_selected_archive_and_updates_pagination(self):
+        user_a = self.register()
+        profile_a = self.profile(name="Имя покупателя", company="Компания")
+        self.client.put("/api/accounts/profile", json=profile_a)
+        exported_a = [self.exported(quantity=quantity) for quantity in (2, 3, 4)]
+        removed_id = exported_a[1].headers["x-order-id"]
+        remaining_ids = {exported.headers["x-order-id"] for exported in (exported_a[0], exported_a[2])}
+        self.register(self.other, "buyer-b@example.com")
+        exported_b = self.exported(self.other, 5)
+        history_b = self.other.get("/api/orders/history").json()
+        catalog = self.client.get("/api/catalog").json()
+        response = self.client.delete(f"/api/orders/history/{removed_id}", headers={"X-Account-Id": user_a["id"]})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {"ok": True})
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        first = self.client.get("/api/orders/history?limit=1").json()
+        second = self.client.get("/api/orders/history?limit=1&offset=1").json()
+        self.assertEqual(first["total"], 2)
+        self.assertEqual(first["next_offset"], 1)
+        self.assertIsNone(second["next_offset"])
+        self.assertEqual({first["orders"][0]["id"], second["orders"][0]["id"]}, remaining_ids)
+        self.assertEqual(self.client.get(f"/api/orders/history/{removed_id}/file").status_code, 404)
+        self.assertEqual(self.client.delete(f"/api/orders/history/{removed_id}").status_code, 404)
+        with sqlite3.connect(Path(self.history_dir) / "accounts.sqlite3") as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM orders WHERE id = ?", (removed_id,)).fetchone()[0], 0)
+        for exported in (exported_a[0], exported_a[2]):
+            self.assertEqual(self.client.get(f"/api/orders/history/{exported.headers['x-order-id']}/file").content,
+                             exported.content)
+        self.assertEqual(self.other.get("/api/orders/history").json(), history_b)
+        self.assertEqual(self.other.get(f"/api/orders/history/{exported_b.headers['x-order-id']}/file").content,
+                         exported_b.content)
+        self.assertEqual(self.client.get("/api/catalog").json(), catalog)
+        self.assertEqual(self.client.get("/api/accounts/me").json()["user"], user_a)
+        self.assertEqual(self.client.get("/api/accounts/profile").json()["profile"],
+                         {"email": user_a["email"], **profile_a})
+
+    def test_stale_account_precondition_cannot_delete_new_accounts_own_saved_order(self):
+        user_a = self.register()
+        self.register(self.other, "buyer-b@example.com")
+        exported_b = self.exported(self.other)
+        order_b = exported_b.headers["x-order-id"]
+        stale = self.other.delete(f"/api/orders/history/{order_b}", headers={"X-Account-Id": user_a["id"]})
+        self.assertEqual(stale.status_code, 409)
+        self.assertEqual(self.other.get("/api/orders/history").json()["total"], 1)
+        self.assertEqual(self.other.get(f"/api/orders/history/{order_b}/file").content, exported_b.content)
+
+    def test_saved_order_deletion_survives_new_process_and_login(self):
+        user = self.register()
+        removed = self.exported()
+        retained = self.exported(quantity=3)
+        removed_id = removed.headers["x-order-id"]
+        retained_id = retained.headers["x-order-id"]
+        response = self.client.delete(f"/api/orders/history/{removed_id}")
+        self.assertEqual(response.status_code, 200, response.text)
+        code = """
+import hashlib,json,sys
+from fastapi.testclient import TestClient
+from app import app
+data=json.load(sys.stdin)
+with TestClient(app) as client:
+    assert client.post('/api/accounts/login',json={'email':data['email'],'password':data['password']}).status_code==200
+    history=client.get('/api/orders/history').json()
+    removed=client.get('/api/orders/history/'+data['removed_id']+'/file')
+    retained=client.get('/api/orders/history/'+data['retained_id']+'/file')
+    assert retained.status_code==200
+    print(json.dumps({'ids':[order['id'] for order in history['orders']],'total':history['total'],
+                      'removed_status':removed.status_code,'retained_hash':hashlib.sha256(retained.content).hexdigest()}))
+"""
+        result = subprocess.run([sys.executable, "-c", code], cwd=Path(__file__).resolve().parents[1],
+                                input=json.dumps({"email": user["email"], "password": PASSWORD,
+                                                  "removed_id": removed_id, "retained_id": retained_id}),
+                                text=True, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"ids": [retained_id], "total": 1, "removed_status": 404,
+                                                   "retained_hash": hashlib.sha256(retained.content).hexdigest()})
+
+    def test_failed_storage_does_not_report_order_deleted(self):
+        self.register()
+        exported = self.exported()
+        order_id = exported.headers["x-order-id"]
+        with patch("account_store.delete_order", side_effect=OSError("private storage detail")):
+            response = self.client.delete(f"/api/orders/history/{order_id}")
+        self.assertEqual(response.status_code, 503)
+        self.assertNotIn("private storage detail", response.text)
+        self.assertEqual(self.client.get("/api/orders/history").json()["total"], 1)
+        self.assertEqual(self.client.get(f"/api/orders/history/{order_id}/file").content, exported.content)
 
     def test_successful_smtp_history_contains_exact_sent_attachment(self):
         self.register()

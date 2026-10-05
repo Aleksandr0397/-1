@@ -1,7 +1,7 @@
 'use strict';
 
 const byId = (id) => document.getElementById(id);
-const state = { config: null, user: null, catalog: { catalog_version: null, products: [] }, products: new Map(), indexed: [], cart: new Map(), shown: 60, filtered: [], sort: null, busy: false, sentSignature: null };
+const state = { config: null, user: null, catalog: { catalog_version: null, products: [] }, products: new Map(), cartProducts: new Map(), indexed: [], cart: new Map(), shown: 60, filtered: [], sort: null, busy: false, sentSignature: null };
 const legacyStorageKey = 'okunev-order-cart-v1';
 const guestStorageKey = 'okunev-order-cart-v2:guest';
 let storageKey = null;
@@ -50,7 +50,7 @@ async function jsonApi(url, options) {
 }
 function saveCart() {
   if (!storageKey) return;
-  try { localStorage.setItem(storageKey, JSON.stringify({ catalog_version: state.catalog.catalog_version, customer: customerFields(), items: Array.from(state.cart, ([product_id, quantity]) => ({ product_id, quantity })) })); } catch (_) { /* The basket still works when browser storage is unavailable. */ }
+  try { localStorage.setItem(storageKey, JSON.stringify({ catalog_version: state.catalog.catalog_version, customer: customerFields(), items: Array.from(state.cart, ([product_id, quantity]) => ({ product_id, quantity, product: state.cartProducts.get(product_id) || state.products.get(product_id) })) })); } catch (_) { /* The basket still works when browser storage is unavailable. */ }
 }
 function selectCartStorage() {
   storageKey = state.user ? 'okunev-order-cart-v2:user:' + state.user.id : guestStorageKey;
@@ -72,7 +72,10 @@ function selectCartStorage() {
     }
   } catch (_) { /* Do not transfer or expose another account's basket if storage fails. */ }
 }
-function restoreCart() {
+function validSnapshot(product, id) {
+  return product && product.id === id && typeof product.name === 'string' && product.name.length <= 500 && typeof product.sku === 'string' && product.sku.length <= 100 && typeof product.unit === 'string' && product.unit.length <= 50 && /^\d{1,9}\.\d{2}$/.test(product.price);
+}
+async function restoreCart() {
   if (!storageKey) return;
   try {
     const saved = JSON.parse(localStorage.getItem(storageKey) || 'null');
@@ -81,18 +84,64 @@ function restoreCart() {
       const input = byId('customer-' + field);
       if (typeof saved.customer?.[field] === 'string') input.value = saved.customer[field].slice(0, input.maxLength);
     }
-    if (saved.catalog_version !== state.catalog.catalog_version) {
-      localStorage.removeItem(storageKey);
-      if (saved.items?.length) notify('Прайс обновился. Соберите заказ по новым ценам.');
-      return;
+    const recovered = new Map();
+    const items = Array.isArray(saved.items) ? saved.items.slice(0, 500) : [];
+    const versions = new Set(items.filter(item => !state.products.has(item.product_id) && (!validSnapshot(item.product, item.product_id) || item.product.unresolved)).map(item => item.product?.source_version || saved.catalog_version));
+    for (const version of versions) {
+      if (typeof version !== 'string' || !version || version.length > 100) continue;
+      try {
+        const archive = await jsonApi('/api/catalog/versions/' + encodeURIComponent(version));
+        for (const product of archive.products) recovered.set(product.id, { ...product, source_version: version });
+      } catch (_) { /* Keep unresolved rows, including their original ID and quantity. */ }
     }
     let removedFractional = false;
-    for (const item of saved.items || []) {
-      if (state.products.has(item.product_id) && validQuantity(item.quantity)) state.cart.set(item.product_id, Number(item.quantity));
-      else if (state.products.has(item.product_id) && Number.isFinite(Number(item.quantity)) && !Number.isInteger(Number(item.quantity))) removedFractional = true;
+    for (const item of items) {
+      if (typeof item.product_id !== 'string' || !item.product_id || item.product_id.length > 100) continue;
+      if (validQuantity(item.quantity)) {
+        const snapshot = recovered.get(item.product_id) || (validSnapshot(item.product, item.product_id) ? item.product : null) || state.products.get(item.product_id) || { id: item.product_id, name: 'Товар из предыдущего прайса · ' + item.product_id, sku: '', unit: '', price: '0.00', unresolved: true, source_version: saved.catalog_version };
+        state.cart.set(item.product_id, Number(item.quantity));
+        state.cartProducts.set(item.product_id, snapshot);
+      } else if (Number.isFinite(Number(item.quantity)) && !Number.isInteger(Number(item.quantity))) removedFractional = true;
     }
-    if (removedFractional) { saveCart(); notify('Позиции с дробным количеством удалены из сохранённого заказа. Добавьте их с целым количеством.'); }
+    if (removedFractional) notify('Позиции с дробным количеством удалены из сохранённого заказа. Добавьте их с целым количеством.');
   } catch (_) { /* Ignore damaged saved baskets. */ }
+}
+function productIdentity(value) { return normalize(value).trim().replace(/\s+/g, ' '); }
+function reconcileCart() {
+  const skuIndex = new Map(), nameIndex = new Map();
+  function add(index, key, product) { if (!index.has(key)) index.set(key, []); index.get(key).push(product); }
+  for (const product of state.catalog.products) {
+    const unit = productIdentity(product.unit);
+    if (product.sku) add(skuIndex, productIdentity(product.sku) + '\u0000' + unit, product);
+    add(nameIndex, productIdentity(product.name) + '\u0000' + unit, product);
+  }
+  const cart = new Map(), snapshots = new Map(), candidates = [], totals = new Map();
+  for (const [id, quantity] of state.cart) {
+    const old = state.cartProducts.get(id) || state.products.get(id);
+    if (!old) continue;
+    let current = state.products.get(id);
+    if (!current && !old.unresolved) {
+      const unit = productIdentity(old.unit);
+      const bySku = old.sku ? skuIndex.get(productIdentity(old.sku) + '\u0000' + unit) : null;
+      if (bySku?.length === 1) current = bySku[0];
+      if (!current) {
+        const byName = nameIndex.get(productIdentity(old.name) + '\u0000' + unit)?.filter(product => !old.sku || !product.sku || productIdentity(old.sku) === productIdentity(product.sku));
+        if (byName?.length === 1) current = byName[0];
+      }
+    }
+    candidates.push({ id, quantity, old, current });
+    if (current) totals.set(current.id, (totals.get(current.id) || 0) + quantity);
+  }
+  for (const { id, quantity, old, current } of candidates) {
+    if (current && (totals.get(current.id) <= 999999 || id === current.id)) {
+      cart.set(current.id, (cart.get(current.id) || 0) + quantity);
+      snapshots.set(current.id, { ...current, available: true, previous_price: old.price !== current.price ? old.price : old.previous_price, restocked: old.available === false || Boolean(old.restocked) });
+    } else {
+      cart.set(id, quantity);
+      snapshots.set(id, { ...old, available: false, restocked: false });
+    }
+  }
+  state.cart = cart; state.cartProducts = snapshots;
 }
 function validQuantity(value) { const number = Number(value); return Number.isInteger(number) && number >= 1 && number <= 999999; }
 function quantityInput(product, value, className) {
@@ -139,16 +188,19 @@ function markCatalogSelection() {
     badge.textContent = quantity ? 'В корзине: ' + wholeNumbers.format(quantity) : '';
   }
 }
-function setCatalog(catalog, restore = false) {
+async function setCatalog(catalog, restore = false) {
   const previous = state.catalog.catalog_version;
+  for (const [id] of state.cart) if (!state.cartProducts.has(id) && state.products.has(id)) state.cartProducts.set(id, { ...state.products.get(id), source_version: previous });
   state.catalog = catalog;
   state.products = new Map(catalog.products.map((product) => [product.id, product]));
   state.indexed = catalog.products.map((product) => ({ product, search: normalize(product.name + ' ' + (product.sku || '')) }));
   if (previous && previous !== catalog.catalog_version) {
-    state.cart.clear(); state.sentSignature = null; saveCart();
-    feedback('order-feedback', 'Прайс обновлён. Добавьте товары из нового каталога.');
+    state.sentSignature = null;
+    feedback('order-feedback', 'Прайс обновлён. Товары и количества сохранены; цены и наличие проверены по новому прайсу.');
   }
-  if (restore) restoreCart();
+  if (restore) await restoreCart();
+  reconcileCart();
+  saveCart();
   byId('catalog-count').textContent = plural(catalog.products.length);
   byId('filename').textContent = catalog.filename || 'Прайс пока не загружен';
   filterProducts(); renderCart();
@@ -189,14 +241,18 @@ function renderProducts() {
     quantityCell.append(quantityStepper(input));
     const action = node('td');
     const button = node('button', 'button product-add', 'В заказ');
+    button.disabled = !storageKey;
     button.type = 'button'; button.setAttribute('aria-label', 'Добавить в заказ: ' + product.name);
     function add() {
+      if (!storageKey) { notify('Обновите страницу, чтобы восстановить свой аккаунт и корзину.'); return; }
       const quantity = Number(input.value);
       if (!validQuantity(quantity)) { input.setCustomValidity('Введите целое количество от 1 до 999 999.'); input.reportValidity(); return; }
       const next = (state.cart.get(product.id) || 0) + quantity;
       if (!validQuantity(next)) { notify('В заказе слишком большое количество этого товара.'); return; }
       if (!state.cart.has(product.id) && state.cart.size >= 500) { notify('В один заказ можно добавить не больше 500 разных товаров.'); return; }
-      input.setCustomValidity(''); state.cart.set(product.id, next); basketChanged(); renderCart();
+      input.setCustomValidity(''); state.cart.set(product.id, next);
+      if (!state.cartProducts.has(product.id)) state.cartProducts.set(product.id, { ...product, available: true });
+      basketChanged(); renderCart();
       button.textContent = 'Добавлено'; setTimeout(() => { button.textContent = 'В заказ'; }, 1100);
     }
     input.addEventListener('input', () => input.setCustomValidity(''));
@@ -246,13 +302,16 @@ function renderCart() {
   const fragment = document.createDocumentFragment();
   let totalCents = 0n;
   for (const [id, quantity] of state.cart) {
-    const product = state.products.get(id);
-    if (!product) { state.cart.delete(id); continue; }
+    const product = state.cartProducts.get(id) || state.products.get(id);
+    if (!product) continue;
+    const available = state.products.has(id) && product.available !== false;
     const item = node('li', 'cart-item');
+    item.classList.toggle('cart-unavailable', !available);
+    item.classList.toggle('cart-restocked', available && Boolean(product.restocked));
     const top = node('div', 'cart-top');
     const remove = node('button', 'icon-button', '×');
     remove.type = 'button'; remove.setAttribute('aria-label', 'Убрать из заказа: ' + product.name);
-    remove.addEventListener('click', () => { state.cart.delete(id); basketChanged(); renderCart(); });
+    remove.addEventListener('click', () => { state.cart.delete(id); state.cartProducts.delete(id); basketChanged(); renderCart(); });
     top.append(node('span', 'cart-name', product.name), remove);
     const controls = node('div', 'cart-controls');
     const wrap = node('div', 'cart-quantity-wrap');
@@ -262,9 +321,13 @@ function renderCart() {
       state.cart.set(id, Number(input.value)); basketChanged(); renderCart();
     });
     wrap.append(quantityStepper(input), node('span', 'cart-unit', product.unit || 'шт'));
-    const amount = lineTotalCents(product, quantity); totalCents += amount;
-    controls.append(wrap, node('span', 'cart-line-total', formatCents(amount)));
-    item.append(top, controls); fragment.append(item);
+    const amount = available ? lineTotalCents(product, quantity) : 0n; totalCents += amount;
+    controls.append(wrap, node('span', 'cart-line-total', available ? formatCents(amount) : 'Не включён в заказ'));
+    item.append(top, controls);
+    if (!available) item.append(node('p', 'cart-availability', 'Нет в новом прайсе · остаётся в корзине'));
+    else if (product.restocked) item.append(node('p', 'cart-availability', 'Снова в наличии'));
+    if (available && product.previous_price && product.previous_price !== product.price) item.append(node('p', 'cart-price-change', 'Цена изменилась: ' + money.format(Number(product.previous_price)) + ' → ' + money.format(Number(product.price))));
+    fragment.append(item);
   }
   byId('cart-items').replaceChildren(fragment);
   byId('cart-empty').hidden = state.cart.size > 0;
@@ -272,6 +335,9 @@ function renderCart() {
   byId('order-count').textContent = state.cart.size;
   byId('header-cart-count').textContent = state.cart.size;
   byId('total').textContent = formatCents(totalCents);
+  const unavailable = Array.from(state.cart.keys()).filter(id => !state.products.has(id) || state.cartProducts.get(id)?.available === false).length;
+  byId('availability-note').hidden = !unavailable;
+  byId('availability-note').textContent = 'Нет в наличии: ' + unavailable + '. Эти позиции остаются в корзине; в заказ войдут только доступные товары.';
   byId('mobile-total').textContent = formatCents(totalCents);
   byId('mobile-count').textContent = plural(state.cart.size);
   byId('mobile-order-bar').hidden = !state.cart.size;
@@ -283,20 +349,21 @@ function customerFields() {
   return { name: byId('customer-name').value.trim(), contact: byId('customer-contact').value.trim(), comment: byId('customer-comment').value.trim() };
 }
 function orderPayload() {
-  return { catalog_version: state.catalog.catalog_version, customer: customerFields(), items: Array.from(state.cart, ([product_id, quantity]) => ({ product_id, quantity: String(quantity) })) };
+  return { catalog_version: state.catalog.catalog_version, customer: customerFields(), items: Array.from(state.cart).filter(([id]) => state.products.has(id) && state.cartProducts.get(id)?.available !== false).map(([product_id, quantity]) => ({ product_id, quantity: String(quantity) })) };
 }
 function updateActions() {
   const sent = state.sentSignature && state.sentSignature === JSON.stringify(orderPayload());
   const needsLogin = state.config?.history_ready && !state.user;
-  byId('download-order').disabled = state.busy || !state.cart.size || needsLogin;
-  byId('send-order').disabled = state.busy || !state.cart.size || needsLogin || !state.config?.mail_ready || Boolean(sent);
+  const available = orderPayload().items.length;
+  byId('download-order').disabled = state.busy || !available || needsLogin || !storageKey;
+  byId('send-order').disabled = state.busy || !available || needsLogin || !storageKey || !state.config?.mail_ready || Boolean(sent);
   byId('send-order').textContent = state.busy ? 'Подождите…' : sent ? 'Заказ отправлен' : 'Отправить заказ';
 }
 async function checkout(send) {
-  if (state.busy || !state.cart.size) return;
+  if (state.busy || !orderPayload().items.length) return;
   const payload = orderPayload(); state.busy = true; updateActions(); feedback('order-feedback', '');
   try {
-    const response = await fetch('/api/orders/' + (send ? 'send' : 'export'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    const response = await fetch('/api/orders/' + (send ? 'send' : 'export'), { method: 'POST', headers: { 'Content-Type': 'application/json', ...(state.user ? { 'X-Account-Id': state.user.id } : {}) }, body: JSON.stringify(payload) });
     if (!response.ok) throw await errorFor(response);
     if (send) {
       await response.json();
@@ -314,7 +381,12 @@ async function checkout(send) {
     }
   } catch (error) {
     feedback('order-feedback', error.message || 'Нет связи с сайтом. Попробуйте ещё раз.', true);
-    if (error.status === 409) await loadCatalog(false);
+    if (error.status === 409) {
+      try {
+        if (state.config?.history_ready && (await jsonApi('/api/accounts/me')).user?.id !== state.user?.id) window.location.reload();
+        else await loadCatalog(false);
+      } catch (_) { feedback('order-feedback', 'Обновите страницу, чтобы проверить текущий аккаунт и корзину.', true); }
+    }
   } finally { state.busy = false; updateActions(); }
 }
 function openUpload() {
@@ -330,12 +402,12 @@ async function upload(event) {
   if (!file || !state.config?.upload_enabled) return;
   if (!/\.(xlsx|xls)$/i.test(file.name)) { feedback('upload-feedback', 'Выберите Excel-файл в формате XLSX или XLS.', true); return; }
   if (file.size > (state.config.max_upload_mb || 10) * 1024 * 1024) { feedback('upload-feedback', 'Файл слишком большой. Максимальный размер — 10 МБ.', true); return; }
-  if (state.cart.size && !window.confirm('Новый прайс заменит текущий каталог и очистит ваш заказ. Продолжить?')) return;
+  if (state.cart.size && !window.confirm('Новый прайс заменит текущий каталог. Товары и количества останутся в корзине; цены и наличие обновятся. Продолжить?')) return;
   const data = new FormData(); data.append('file', file);
   const button = byId('upload-submit'); button.disabled = true; button.textContent = 'Загружаем прайс…'; feedback('upload-feedback', '');
   try {
     const catalog = await jsonApi('/api/catalog/import', { method: 'POST', headers: { 'X-Admin-Token': byId('admin-password').value }, body: data });
-    byId('search').value = ''; setCatalog(catalog); closeUpload();
+    byId('search').value = ''; await setCatalog(catalog); closeUpload();
     notify('Прайс загружен: ' + plural(catalog.products.length) + '.');
     byId('search').focus();
   } catch (error) { feedback('upload-feedback', error.message || 'Загрузка не удалась. Проверьте соединение и повторите.', true); }
@@ -343,7 +415,7 @@ async function upload(event) {
 }
 async function loadCatalog(restore) {
   byId('load-error').hidden = true;
-  try { setCatalog(await jsonApi('/api/catalog'), restore); }
+  try { await setCatalog(await jsonApi('/api/catalog'), restore); }
   catch (error) {
     byId('load-error').querySelector('span').textContent = 'Не удалось загрузить каталог. Проверьте соединение и повторите.';
     byId('load-error').hidden = false;
@@ -376,7 +448,9 @@ async function start() {
 byId('search').addEventListener('input', () => { clearTimeout(searchTimer); searchTimer = setTimeout(filterProducts, 60); });
 byId('load-more').addEventListener('click', () => { state.shown += 60; renderProducts(); });
 for (const field of ['name', 'price']) byId('sort-' + field)?.addEventListener('click', () => sortProducts(field));
-byId('clear-cart').addEventListener('click', () => { state.cart.clear(); basketChanged(); renderCart(); });
+byId('clear-cart').addEventListener('click', () => { byId('clear-cart-dialog').showModal(); byId('clear-cart-cancel').focus(); });
+for (const id of ['clear-cart-cancel', 'clear-cart-close']) byId(id).addEventListener('click', () => byId('clear-cart-dialog').close());
+byId('clear-cart-confirm').addEventListener('click', () => { state.cart.clear(); state.cartProducts.clear(); basketChanged(); renderCart(); byId('clear-cart-dialog').close(); });
 byId('customer-form').addEventListener('input', () => { state.sentSignature = null; saveCart(); updateActions(); });
 byId('customer-form').addEventListener('submit', (event) => event.preventDefault());
 byId('send-order').addEventListener('click', () => checkout(true));

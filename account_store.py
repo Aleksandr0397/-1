@@ -19,7 +19,7 @@ from pathlib import Path
 SCHEMA = "okunev_orders"
 SESSION_SECONDS = 30 * 24 * 60 * 60
 PASSWORD_ITERATIONS = 600_000
-TABLES = "catalog_meta|products|users|account_profiles|sessions|orders"
+TABLES = "catalog_meta|catalog_archive|products|users|account_profiles|sessions|orders"
 
 
 class DuplicateAccount(ValueError):
@@ -290,3 +290,11 @@ def order_file(user_id, order_id):
         row = connection.execute("SELECT filename, document FROM orders WHERE id = ? AND user_id = ?",
                                  (order_id, user_id)).fetchone()
     return (row["filename"], bytes(row["document"])) if row else None
+
+
+def delete_order(user_id, order_id):
+    with database() as connection:
+        cursor = connection.execute("DELETE FROM orders WHERE id = ? AND user_id = ?", (order_id, user_id))
+        removed = cursor.rowcount == 1
+        connection.commit()
+    return removed

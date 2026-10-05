@@ -4,6 +4,9 @@ const money = new Intl.NumberFormat('ru-RU', { style: 'currency', currency: 'RUB
 const dates = new Intl.DateTimeFormat('ru-RU', { dateStyle: 'long', timeStyle: 'short' });
 let mode = 'login';
 let nextOffset = null;
+let currentUser = null;
+let pendingDelete = null;
+let deleting = false;
 function prepareGuestCart(user) {
   try {
     const legacyKey = 'okunev-order-cart-v1';
@@ -29,12 +32,20 @@ function message(text, error = false) {
   el('history-feedback').classList.toggle('error', error);
 }
 async function jsonApi(url, options = {}) {
-  const response = await fetch(url, { ...options, headers: { 'Content-Type': 'application/json', ...options.headers } });
-  const body = await response.json();
-  if (!response.ok) throw new Error(typeof body.detail === 'string' ? body.detail : 'Не удалось выполнить действие. Проверьте данные.');
+  const response = await fetch(url, { ...options, cache: 'no-store', headers: { 'Content-Type': 'application/json', ...options.headers } });
+  let body;
+  try { body = await response.json(); } catch (_) { /* The hosting proxy can return an HTML error. */ }
+  if (!response.ok) {
+    const error = new Error(typeof body?.detail === 'string' ? body.detail : 'Не удалось выполнить действие. Проверьте данные.');
+    error.status = response.status;
+    throw error;
+  }
+  if (!body) throw new Error('Не удалось получить данные. Попробуйте ещё раз.');
   return body;
 }
 function accountView(user) {
+  currentUser = user;
+  closeDeleteDialog();
   el('account-link').textContent = user ? 'Мой аккаунт' : 'Войти';
   el('account-card').hidden = Boolean(user);
   el('account-bar').hidden = !user;
@@ -67,6 +78,7 @@ async function download(order) {
 }
 function orderCard(order) {
   const card = node('article', 'history-card');
+  card.dataset.orderId = order.id;
   const heading = node('div', 'history-card-heading');
   const created = new Date(order.created_at);
   heading.append(node('h2', '', 'Заказ от ' + (Number.isNaN(created.getTime()) ? order.created_at : dates.format(created))), node('strong', '', money.format(Number(order.total))));
@@ -83,11 +95,66 @@ function orderCard(order) {
   }
   details.append(list); card.append(details);
   const button = node('button', 'button button-outline', 'Скачать Excel'); button.type = 'button';
-  button.addEventListener('click', () => download(order)); card.append(button);
+  button.addEventListener('click', () => download(order));
+  const remove = node('button', 'button button-delete', 'Удалить'); remove.type = 'button';
+  remove.setAttribute('aria-label', 'Удалить заказ № ' + order.id);
+  remove.addEventListener('click', () => openDeleteDialog(order));
+  const actions = node('div', 'history-actions'); actions.append(button, remove); card.append(actions);
   return card;
 }
+function closeDeleteDialog() {
+  el('delete-order-dialog').close();
+  pendingDelete = null;
+  el('delete-order-name').textContent = '';
+  el('delete-order-feedback').textContent = '';
+  el('delete-order-feedback').hidden = true;
+}
+function openDeleteDialog(order) {
+  if (!currentUser || deleting) return;
+  pendingDelete = { id: order.id, userId: currentUser.id };
+  const created = new Date(order.created_at);
+  el('delete-order-name').textContent = 'Заказ от ' + (Number.isNaN(created.getTime()) ? order.created_at : dates.format(created)) + ' · № ' + order.id;
+  el('delete-order-feedback').hidden = true;
+  el('delete-order-dialog').showModal();
+  el('delete-order-keep').focus();
+}
+async function deleteOrder() {
+  if (!pendingDelete || deleting) return;
+  const order = pendingDelete;
+  deleting = true;
+  for (const id of ['delete-order-confirm', 'delete-order-keep', 'delete-order-close']) el(id).disabled = true;
+  el('delete-order-feedback').hidden = true;
+  try {
+    await jsonApi('/api/orders/history/' + encodeURIComponent(order.id), { method: 'DELETE', headers: { 'X-Account-Id': order.userId } });
+  } catch (error) {
+    if (error.status === 401 || error.status === 409) {
+      accountView(null);
+      message(error.message || 'Войдите в свой аккаунт.', true);
+    } else {
+      el('delete-order-feedback').textContent = error.message || 'Не удалось удалить заказ. Попробуйте ещё раз.';
+      el('delete-order-feedback').classList.add('error');
+      el('delete-order-feedback').hidden = false;
+    }
+    return;
+  } finally {
+    deleting = false;
+    for (const id of ['delete-order-confirm', 'delete-order-keep', 'delete-order-close']) el(id).disabled = false;
+  }
+  closeDeleteDialog();
+  for (const card of el('history-list').children) if (card.dataset.orderId === order.id) card.remove();
+  try { await loadOrders(); message('Заказ удалён.'); }
+  catch (_) { message('Заказ удалён. Не удалось обновить список — обновите страницу.', true); }
+}
 async function loadOrders(append = false) {
-  const result = await jsonApi('/api/orders/history?offset=' + (append ? nextOffset : 0));
+  const owner = currentUser?.id;
+  let result;
+  try {
+    result = await jsonApi('/api/orders/history?offset=' + (append ? nextOffset : 0), { headers: { 'X-Account-Id': owner || '' } });
+    if (currentUser?.id !== owner) return;
+  } catch (error) {
+    if (error.status === 401 || error.status === 409) accountView(null);
+    throw error;
+  }
   if (!append) el('history-list').replaceChildren();
   for (const order of result.orders) el('history-list').append(orderCard(order));
   nextOffset = result.next_offset;
@@ -125,6 +192,12 @@ el('history-more').addEventListener('click', async () => {
   el('history-more').disabled = true;
   try { await loadOrders(true); } catch (error) { message(error.message, true); }
   finally { el('history-more').disabled = false; }
+});
+el('delete-order-confirm').addEventListener('click', deleteOrder);
+for (const id of ['delete-order-keep', 'delete-order-close']) el(id).addEventListener('click', () => { if (!deleting) closeDeleteDialog(); });
+el('delete-order-dialog').addEventListener('cancel', (event) => {
+  event.preventDefault();
+  if (!deleting) closeDeleteDialog();
 });
 window.addEventListener('pageshow', (event) => { if (event.persisted) window.location.reload(); });
 start();

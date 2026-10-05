@@ -65,6 +65,19 @@
 .history-positions li span:last-child{flex-shrink:0;text-align:right}
 .history-card .button{margin-top:10px}
 #history-more{margin-top:20px}
+.history-actions,.dialog-actions{display:flex;flex-wrap:wrap;gap:10px}
+.dialog-actions{justify-content:flex-end;margin-top:20px}
+.delete-order-name{margin-top:16px;color:var(--muted);font-size:.875rem;overflow-wrap:anywhere}
+.button-delete{border-color:#e7c6c1;color:#a72a1e;background:white}
+.button-delete:hover:not(:disabled){background:#fff1ee}
+.button-danger{background:#b42318;color:white}
+.button-danger:hover:not(:disabled){background:#951b12}
+.cart-unavailable .cart-name{text-decoration:line-through;color:var(--muted)}
+.cart-unavailable .cart-line-total{color:var(--muted);font-size:.8125rem;white-space:normal;text-align:right}
+.cart-availability,.cart-price-change{margin-top:9px;font-size:.8125rem;line-height:1.5}
+.cart-availability{color:var(--muted)}
+.cart-restocked .cart-availability{color:#286437;font-weight:600}
+.cart-price-change{color:#925700}
 @media(max-width:620px){.header-actions .cart-nav{flex:1}.header-actions .cart-nav #cart-link{flex:1}.header-actions .cart-nav #toggle-cart{flex:0 0 40px}.full-cart .order-actions{grid-template-columns:1fr}.history-card,.account-card{padding:20px}.history-positions li{flex-direction:column;gap:6px}.history-positions li span:last-child{text-align:left}}
 
 .sort-button{display:inline-flex;align-items:center;gap:7px;border:0;border-radius:6px;padding:5px 6px;margin-left:-6px;background:transparent;color:inherit;font:inherit;min-height:36px}

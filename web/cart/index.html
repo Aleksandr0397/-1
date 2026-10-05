@@ -81,6 +81,7 @@
       </div>
       <p class="order-note" id="mail-note">Проверяем возможность отправки…</p>
       <p class="order-note" id="history-note">Проверяем сохранение заказов…</p>
+      <p class="order-note" id="availability-note" hidden></p>
       <div class="feedback" id="order-feedback" role="status" aria-live="polite" hidden></div>
       <button class="clear-cart" id="clear-cart" type="button" hidden>Очистить заказ</button>
     </aside>
@@ -105,6 +106,11 @@
       <div class="feedback" id="upload-feedback" role="status" aria-live="polite" hidden></div>
       <button class="button button-primary" id="upload-submit" type="submit">Загрузить прайс</button>
     </form>
+  </dialog>
+  <dialog class="upload-dialog" id="clear-cart-dialog" aria-labelledby="clear-cart-heading">
+    <div class="dialog-heading"><h2 id="clear-cart-heading">Очистить заказ?</h2><button class="icon-button" id="clear-cart-close" type="button" aria-label="Отменить очистку и закрыть окно">×</button></div>
+    <p class="dialog-description">Все товары будут убраны из текущей корзины.</p>
+    <div class="dialog-actions"><button class="button button-outline" id="clear-cart-cancel" type="button">Отменить</button><button class="button button-danger" id="clear-cart-confirm" type="button">Подтвердить</button></div>
   </dialog>
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
 </body>
