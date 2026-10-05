@@ -1,0 +1,9 @@
+{
+  "ticker": "SBER",
+  "source": "moex",
+  "board": "TQBR",
+  "current_lot": 1,
+  "candles": 510,
+  "csv": "data/sber-2023-2024.csv",
+  "warning": "Current lot may differ from historical lot; unadjusted prices"
+}
