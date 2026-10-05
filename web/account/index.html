@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#153db9">
+  <title>Мой аккаунт — Окунев</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/account.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#profile-heading">Перейти к личным данным</a>
+  <header class="site-header"><div class="header-inner">
+    <a class="brand" href="/" aria-label="Окунев — главная"><span class="brand-mark" aria-hidden="true">О</span><span><strong>Окунев</strong><span class="brand-caption">Заказ по прайс-листу</span></span></a>
+    <div class="header-actions">
+      <a class="button button-outline" href="/cart/">Корзина</a>
+      <a class="button button-quiet" href="/">Каталог</a>
+      <a class="button button-quiet" href="/orders/">Заказы</a>
+      <a class="button button-quiet" href="/account/" id="account-link" aria-current="page">Войти</a>
+    </div>
+  </div></header>
+  <main class="workspace account-workspace">
+    <section aria-labelledby="profile-heading">
+      <div class="section-heading"><div><span class="eyebrow">Личный кабинет</span><h1 id="profile-heading" tabindex="-1">Мой аккаунт</h1></div></div>
+      <p class="history-intro">Ваши контактные данные, компания и адрес доставки.</p>
+      <div class="feedback" id="account-feedback" role="status" aria-live="polite">Проверяем аккаунт…</div>
+      <button class="button button-outline profile-retry" id="account-retry" type="button" hidden>Повторить загрузку</button>
+      <section class="account-card" id="account-card" aria-labelledby="account-heading" hidden>
+        <h2 id="account-heading">Войдите в свой аккаунт</h2>
+        <div class="auth-tabs"><button class="button button-primary" id="auth-login" type="button" aria-pressed="true">Вход</button><button class="button button-quiet" id="auth-register" type="button" aria-pressed="false">Регистрация</button></div>
+        <form id="account-form">
+          <label for="account-email">Электронная почта</label><input id="account-email" type="email" maxlength="254" autocomplete="username" required>
+          <label for="account-password">Пароль</label><input id="account-password" type="password" minlength="8" maxlength="128" autocomplete="current-password" required>
+          <p class="format-hint">При регистрации придумайте пароль от 8 символов.</p>
+          <button class="button button-primary" id="account-submit" type="submit">Войти</button>
+        </form>
+      </section>
+      <div class="account-bar" id="account-bar" hidden><span id="account-user"></span><button class="button button-quiet" id="account-logout" type="button">Выйти</button></div>
+      <section class="profile-card" id="profile-card" aria-labelledby="personal-data-heading" hidden>
+        <h2 id="personal-data-heading">Личные данные</h2>
+        <p class="profile-description">Сохранённые данные доступны в вашем аккаунте с любого устройства.</p>
+        <form id="profile-form">
+          <div class="profile-fields">
+            <div class="profile-field"><label for="profile-name">Имя</label><input id="profile-name" maxlength="100" autocomplete="name" placeholder="Как к вам обращаться"></div>
+            <div class="profile-field"><label for="profile-phone">Телефон</label><input id="profile-phone" type="tel" maxlength="40" autocomplete="tel" placeholder="+7 …"></div>
+            <div class="profile-field profile-field-wide"><label for="profile-email">Электронная почта</label><input id="profile-email" type="email" readonly aria-describedby="profile-email-hint"><p class="format-hint" id="profile-email-hint">Почта, с которой вы входите в аккаунт.</p></div>
+            <div class="profile-field profile-field-wide"><label for="profile-company">Название компании</label><input id="profile-company" maxlength="200" autocomplete="organization" placeholder="Компания или ИП"></div>
+            <div class="profile-field profile-field-wide"><label for="profile-delivery-address">Адрес доставки</label><textarea id="profile-delivery-address" maxlength="500" rows="3" autocomplete="street-address" placeholder="Город, улица, дом и другие сведения для доставки"></textarea></div>
+          </div>
+          <div class="profile-actions"><button class="button button-primary" id="profile-save" type="submit">Сохранить данные</button><a class="button button-outline" href="/orders/">Мои заказы</a></div>
+          <div class="feedback" id="profile-feedback" role="status" aria-live="polite" hidden></div>
+        </form>
+      </section>
+    </section>
+  </main>
+  <footer class="site-footer"><span>Окунев</span><span>Поиск. Выбор. Заказ.</span></footer>
+</body>
+</html>

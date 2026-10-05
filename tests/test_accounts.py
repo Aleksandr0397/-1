@@ -97,6 +97,127 @@ class AccountTests(unittest.TestCase):
             self.assertEqual(self.client.post(endpoint, json=self.order()).status_code, 401)
         self.assertEqual(self.client.get("/api/orders/history").status_code, 401)
 
+    def profile(self, **changes):
+        return {"name": "", "phone": "", "company": "", "delivery_address": "", **changes}
+
+    def test_profile_requires_login_and_configured_storage(self):
+        for method in ("get", "put"):
+            kwargs = {"json": self.profile()} if method == "put" else {}
+            response = getattr(self.client, method)("/api/accounts/profile", **kwargs)
+            self.assertEqual(response.status_code, 401)
+            with patch.dict(os.environ, {"ORDERS_HISTORY_DIR": ""}):
+                response = getattr(self.client, method)("/api/accounts/profile", **kwargs)
+                self.assertEqual(response.status_code, 503)
+        self.register()
+        self.client.post("/api/accounts/logout")
+        self.assertEqual(self.client.get("/api/accounts/profile").status_code, 401)
+
+    def test_existing_account_gets_empty_profile_without_changing_identity_or_history(self):
+        user = self.register()
+        exported = self.exported()
+        with sqlite3.connect(Path(self.history_dir) / "accounts.sqlite3") as connection:
+            # An existing production account predates the additive profile table.
+            connection.execute("DROP TABLE IF EXISTS account_profiles")
+        expected = {"email": user["email"], **self.profile()}
+        response = self.client.get("/api/accounts/profile")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {"profile": expected})
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        self.assertEqual(self.client.get("/api/accounts/me").json()["user"], user)
+        self.assertEqual(self.client.get(f"/api/orders/history/{exported.headers['x-order-id']}/file").content,
+                         exported.content)
+
+    def test_profile_save_trims_fields_survives_new_process_and_can_be_cleared(self):
+        user = self.register()
+        values = self.profile(name="  Александр  ", phone=" +7 (999) 123-45-67 ",
+                              company=" ООО Окунев ", delivery_address=" Москва, ул. Лесная, 1 ")
+        response = self.client.put("/api/accounts/profile", json=values)
+        self.assertEqual(response.status_code, 200, response.text)
+        expected = {"email": user["email"], **{key: value.strip() for key, value in values.items()}}
+        self.assertEqual(response.json(), {"profile": expected})
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        self.assertEqual(self.client.get("/api/accounts/profile").json()["profile"], expected)
+        code = """
+import json,sys
+from fastapi.testclient import TestClient
+from app import app
+data=json.load(sys.stdin)
+with TestClient(app) as client:
+    login=client.post('/api/accounts/login',json={'email':data['email'],'password':data['password']})
+    assert login.status_code==200
+    response=client.get('/api/accounts/profile')
+    assert response.status_code==200
+    print(json.dumps(response.json()))
+"""
+        result = subprocess.run([sys.executable, "-c", code], cwd=Path(__file__).resolve().parents[1],
+                                input=json.dumps({"email": user["email"], "password": PASSWORD}),
+                                text=True, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"profile": expected})
+        cleared = self.client.put("/api/accounts/profile", json=self.profile())
+        self.assertEqual(cleared.status_code, 200, cleared.text)
+        self.assertEqual(cleared.json(), {"profile": {"email": user["email"], **self.profile()}})
+        self.assertEqual(self.client.get("/api/accounts/me").json()["user"], user)
+
+    def test_profile_is_private_and_owner_identity_cannot_be_injected(self):
+        user_a = self.register()
+        profile_a = self.profile(name="Покупатель А", phone="111", company="Компания А", delivery_address="Адрес А")
+        self.assertEqual(self.client.put("/api/accounts/profile", json=profile_a).status_code, 200)
+        user_b = self.register(self.other, "buyer-b@example.com")
+        initial_b = self.other.get(f"/api/accounts/profile?user_id={user_a['id']}")
+        self.assertEqual(initial_b.json(), {"profile": {"email": user_b["email"], **self.profile()}})
+        for injected in ({"user_id": user_a["id"]}, {"email": user_a["email"]}, {"id": user_a["id"]}):
+            self.assertEqual(self.other.put("/api/accounts/profile", json={**self.profile(), **injected}).status_code, 422)
+        profile_b = self.profile(name="Покупатель Б", company="Компания Б")
+        self.assertEqual(self.other.put("/api/accounts/profile", json=profile_b).status_code, 200)
+        self.assertEqual(self.client.get("/api/accounts/profile").json(),
+                         {"profile": {"email": user_a["email"], **profile_a}})
+        self.assertEqual(self.other.get("/api/accounts/profile").json(),
+                         {"profile": {"email": user_b["email"], **profile_b}})
+
+    def test_profile_validation_rejects_invalid_fields_without_overwriting_saved_values(self):
+        self.register()
+        saved = self.profile(name="Сохранённое имя", company="Компания")
+        self.assertEqual(self.client.put("/api/accounts/profile", json=saved).status_code, 200)
+        invalid = []
+        for field, limit in (("name", 100), ("phone", 40), ("company", 200), ("delivery_address", 500)):
+            invalid.append(self.profile(**{field: "я" * (limit + 1)}))
+            for value in (None, 42, True, []):
+                invalid.append(self.profile(**{field: value}))
+        invalid.extend(({"name": "Only one field"}, {**self.profile(), "unexpected": "value"}))
+        for values in invalid:
+            with self.subTest(values=values):
+                self.assertEqual(self.client.put("/api/accounts/profile", json=values).status_code, 422)
+        self.assertEqual(self.client.get("/api/accounts/profile").json()["profile"]["name"], saved["name"])
+        boundary = self.profile(name="я" * 100, phone="1" * 40, company="я" * 200, delivery_address="я" * 500)
+        self.assertEqual(self.client.put("/api/accounts/profile", json=boundary).status_code, 200)
+
+    def test_stale_profile_form_cannot_read_or_overwrite_after_account_switch(self):
+        user_a = self.register()
+        profile_a = self.profile(name="Покупатель А")
+        self.assertEqual(self.client.put("/api/accounts/profile", json=profile_a).status_code, 200)
+        user_b = self.register(self.other, "buyer-b@example.com")
+        stale_header = {"X-Account-Id": user_a["id"]}
+        self.assertEqual(self.other.get("/api/accounts/profile", headers=stale_header).status_code, 409)
+        self.assertEqual(self.other.put("/api/accounts/profile", headers=stale_header, json=profile_a).status_code, 409)
+        self.assertEqual(self.other.get("/api/accounts/profile").json(),
+                         {"profile": {"email": user_b["email"], **self.profile()}})
+        self.assertEqual(self.client.get("/api/accounts/profile", headers=stale_header).status_code, 200)
+
+    def test_profile_changes_never_rewrite_historical_customer_or_excel(self):
+        self.register()
+        order = self.order()
+        order["customer"] = {"name": "Первое имя", "contact": "Первый контакт", "comment": "Первый комментарий"}
+        exported = self.client.post("/api/orders/export", json=order)
+        self.assertEqual(exported.status_code, 200, exported.text)
+        original_history = self.client.get("/api/orders/history").json()
+        response = self.client.put("/api/accounts/profile", json=self.profile(
+            name="Новое имя", phone="Новый телефон", company="Новая компания", delivery_address="Новый адрес"))
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.client.get("/api/orders/history").json(), original_history)
+        restored = self.client.get(f"/api/orders/history/{exported.headers['x-order-id']}/file")
+        self.assertEqual(restored.content, exported.content)
+
     def test_password_and_session_are_hashed_cookie_is_private_and_email_normalized(self):
         response = self.client.post("/api/accounts/register", json={"email": " Buyer-A@Example.COM ", "password": PASSWORD})
         self.assertEqual(response.status_code, 200, response.text)

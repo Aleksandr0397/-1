@@ -361,7 +361,7 @@ async function start() {
       const identity = await jsonApi('/api/accounts/me');
       state.user = identity.user;
       note.textContent = state.user ? 'Готовые заказы сохраняются в вашем личном списке.' : 'Войдите, чтобы оформлять и сохранять заказы: ';
-      const link = node('a', '', state.user ? 'Мои заказы' : 'Вход и регистрация'); link.href = '/orders/';
+      const link = node('a', '', state.user ? 'Мои заказы' : 'Вход и регистрация'); link.href = state.user ? '/orders/' : '/account/';
       note.append(document.createTextNode(' '), link);
     } else note.textContent = 'Сохранение истории на сервере пока не подключено. Excel-заказ можно скачать.';
     selectCartStorage();

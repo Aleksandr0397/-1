@@ -633,6 +633,14 @@ class AccountCredentials(BaseModel):
         return value
 
 
+class AccountProfile(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, str_strip_whitespace=True)
+    name: str = Field(max_length=100)
+    phone: str = Field(max_length=40)
+    company: str = Field(max_length=200)
+    delivery_address: str = Field(max_length=500)
+
+
 def session_secure(request):
     setting = os.environ.get("SESSION_COOKIE_SECURE", "").strip().lower()
     return setting in {"1", "true", "yes"} if setting else request.url.scheme == "https"
@@ -651,6 +659,24 @@ def account_me(request: Request):
     available = account_store.available()
     user = storage_call(account_store.user_for_session, request.cookies.get("okunev_session")) if available else None
     return JSONResponse({"available": available, "user": user}, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/accounts/profile")
+def account_profile(request: Request, x_account_id: str | None = Header(default=None)):
+    user = require_account(request)
+    if x_account_id is not None and x_account_id != user["id"]:
+        raise HTTPException(409, "Аккаунт изменился. Обновите страницу и войдите в нужный аккаунт.")
+    return JSONResponse({"profile": storage_call(account_store.profile, user)},
+                        headers={"Cache-Control": "no-store"})
+
+
+@app.put("/api/accounts/profile")
+def update_account_profile(details: AccountProfile, request: Request, x_account_id: str | None = Header(default=None)):
+    user = require_account(request)
+    if x_account_id is not None and x_account_id != user["id"]:
+        raise HTTPException(409, "Аккаунт изменился. Обновите страницу и войдите в нужный аккаунт.")
+    return JSONResponse({"profile": storage_call(account_store.save_profile, user, details.model_dump())},
+                        headers={"Cache-Control": "no-store"})
 
 
 @app.post("/api/accounts/register")

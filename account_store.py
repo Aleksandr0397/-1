@@ -19,7 +19,7 @@ from pathlib import Path
 SCHEMA = "okunev_orders"
 SESSION_SECONDS = 30 * 24 * 60 * 60
 PASSWORD_ITERATIONS = 600_000
-TABLES = "catalog_meta|products|users|sessions|orders"
+TABLES = "catalog_meta|products|users|account_profiles|sessions|orders"
 
 
 class DuplicateAccount(ValueError):
@@ -138,6 +138,11 @@ def initialize(connection, binary_type):
             id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE,
             password_hash TEXT NOT NULL, created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS account_profiles (
+            user_id TEXT PRIMARY KEY REFERENCES users(id),
+            name TEXT NOT NULL, phone TEXT NOT NULL,
+            company TEXT NOT NULL, delivery_address TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS sessions (
             token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id),
             expires_at BIGINT NOT NULL
@@ -230,6 +235,27 @@ def logout(token):
     with database() as connection:
         connection.execute("DELETE FROM sessions WHERE token_hash = ?", (token_hash(token),))
         connection.commit()
+
+
+def profile(user):
+    with database() as connection:
+        row = connection.execute("""
+            SELECT name, phone, company, delivery_address FROM account_profiles WHERE user_id = ?
+        """, (user["id"],)).fetchone()
+    details = dict(row) if row else {"name": "", "phone": "", "company": "", "delivery_address": ""}
+    return {"email": user["email"], **details}
+
+
+def save_profile(user, details):
+    with database() as connection:
+        connection.execute("""
+            INSERT INTO account_profiles (user_id, name, phone, company, delivery_address)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (user_id) DO UPDATE SET name = excluded.name, phone = excluded.phone,
+                company = excluded.company, delivery_address = excluded.delivery_address
+        """, (user["id"], details["name"], details["phone"], details["company"], details["delivery_address"]))
+        connection.commit()
+    return {"email": user["email"], **details}
 
 
 def save_order(user_id, order_id, created_at, filename, status, total, positions, customer, document):
