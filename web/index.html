@@ -8,7 +8,7 @@
   <title>Окунев — заказ по прайс-листу</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%23153db9'/%3E%3Ctext x='32' y='47' text-anchor='middle' font-size='46' font-family='Arial' font-weight='bold' fill='white'%3EО%3C/text%3E%3C/svg%3E">
   <link rel="stylesheet" href="/styles.css">
-  <script src="/app.js" defer></script>
+  <script src="/app.js?v=20261005-clear-confirm" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#search">Перейти к поиску товаров</a>
@@ -107,10 +107,10 @@
       <button class="button button-primary" id="upload-submit" type="submit">Загрузить прайс</button>
     </form>
   </dialog>
-  <dialog class="upload-dialog" id="clear-cart-dialog" aria-labelledby="clear-cart-heading">
-    <div class="dialog-heading"><h2 id="clear-cart-heading">Очистить заказ?</h2><button class="icon-button" id="clear-cart-close" type="button" aria-label="Отменить очистку и закрыть окно">×</button></div>
-    <p class="dialog-description">Все товары будут убраны из текущей корзины.</p>
-    <div class="dialog-actions"><button class="button button-outline" id="clear-cart-cancel" type="button">Отменить</button><button class="button button-danger" id="clear-cart-confirm" type="button">Подтвердить</button></div>
+  <dialog class="upload-dialog" id="clear-cart-dialog" aria-labelledby="clear-cart-heading" aria-describedby="clear-cart-description">
+    <div class="dialog-heading"><h2 id="clear-cart-heading">Подтверждение удаления</h2><button class="icon-button" id="clear-cart-close" type="button" aria-label="Отменить очистку и закрыть окно">×</button></div>
+    <p class="dialog-description" id="clear-cart-description">Действительно вы хотите удалить весь заказ?</p>
+    <div class="dialog-actions"><button class="button button-outline" id="clear-cart-cancel" type="button">Отменить</button><button class="button button-danger" id="clear-cart-confirm" type="button">Удалить</button></div>
   </dialog>
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
 </body>
