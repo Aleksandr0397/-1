@@ -165,6 +165,23 @@ class HttpContractTests(unittest.TestCase):
 
 
 class CandleTests(unittest.TestCase):
+    def test_daily_request_works_with_gateway_without_optional_limit(self):
+        requests = []
+
+        def gateway(request, timeout):
+            body = json.loads(request.data)
+            requests.append(body)
+            if 'limit' in body:
+                raise urllib.error.HTTPError(request.full_url, 400, 'Invalid argument', {},
+                    io.BytesIO(b'{"code":3,"message":"Unknown field limit"}'))
+            return b'{"candles":[]}'
+
+        client = TInvestClient(SECRET, transport=gateway)
+        self.assertEqual(client.get_daily_candles('share-uid', datetime(2026, 1, 1, tzinfo=UTC),
+                                                datetime(2026, 2, 1, tzinfo=UTC)), [])
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0]['candleSourceType'], 'CANDLE_SOURCE_EXCHANGE')
+
     def test_pages_are_bounded_sorted_deduplicated_and_complete_utc(self):
         start = datetime(2020, 1, 1, tzinfo=UTC)
         boundary = start + timedelta(days=365)

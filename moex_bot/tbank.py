@@ -262,7 +262,9 @@ class TInvestClient:
             page_end = min(cursor + _DAY_WINDOW, end)
             result = self._call("MarketDataService", "GetCandles", {
                 "instrumentId": instrument_id, "from": _json_time(cursor), "to": _json_time(page_end),
-                "interval": "CANDLE_INTERVAL_DAY", "candleSourceType": "CANDLE_SOURCE_EXCHANGE", "limit": 2400,
+                # A one-year daily window fits the service's default response
+                # size. Omit the optional limit for older REST gateways.
+                "interval": "CANDLE_INTERVAL_DAY", "candleSourceType": "CANDLE_SOURCE_EXCHANGE",
             })
             for item in _objects(result, "candles"):
                 try:
