@@ -206,3 +206,79 @@ class DashboardTests(unittest.TestCase):
           assert.equal(h.text().includes('SECRET'), false);
           assert.deepEqual(h.pollDelays(), [30000]);
         """)
+
+    def test_automatic_mode_displays_actual_check_times_and_last_result(self):
+        self.run_script(r"""
+          const automation = {enabled:true, status:'waiting', interval_seconds:300,
+            last_checked_at:'2026-10-06T12:00:00Z', next_check_at:'2026-10-06T12:05:00Z',
+            last_result:{action:'wait', reason:'pending_order_uncertain', lots:2,
+              order_status:null, token:'SECRET_ORDER_TOKEN'}, error:null};
+          await h.start(h.fixture({execution_mode:'sandbox_auto', automation,
+            last_action:'buy', action_reason:'sma_buy_proposal', planned_lots:99}));
+          assert.match(h.elements.modeTitle.textContent, /Автоторговля в песочнице.*каждые 5 мин/);
+          assert.match(h.elements.modeDescription.textContent, /Закрытие страницы.*не останавливает/);
+          assert.equal(h.elements.hostingNotice.hidden, false);
+          assert.equal(h.elements.automationNotice.hidden, true);
+          assert.equal(h.elements.automationTimes.hidden, false);
+          assert.match(h.elements.lastChecked.textContent, /15:00:00/);
+          assert.match(h.elements.nextCheck.textContent, /15:05:00/);
+          assert.equal(h.elements.signalHeading.textContent, 'Последний шаг бота');
+          assert.equal(h.elements.action.textContent, 'Ожидать');
+          assert.match(h.elements.reason.textContent, /требует проверки/);
+          assert.equal(h.elements.plannedLots.textContent, 'План, лотов: 2');
+          assert.equal(h.text().includes('SECRET'), false);
+          assert.deepEqual(h.pollDelays(), [30000]);
+          await h.visibility(true);
+          assert.deepEqual(h.pollDelays(), []);
+          assert.equal(h.requests.length, 1);
+        """)
+
+    def test_automation_stops_are_prominent_even_with_connected_or_retained_data(self):
+        self.run_script(r"""
+          const automation = {enabled:true, status:'error', interval_seconds:300,
+            last_checked_at:'2026-10-06T12:00:00Z', next_check_at:null,
+            last_result:null, error:'SECRET_STATE_DETAIL'};
+          await h.start(h.fixture({execution_mode:'sandbox_auto', automation}));
+          assert.equal(h.elements.connection.dataset.state, 'connected');
+          assert.equal(h.elements.automationNotice.hidden, false);
+          assert.equal(h.elements.modeTitle.textContent, 'Автоторговля остановлена');
+          assert.match(h.elements.modeDescription.textContent, /Новые виртуальные заявки не отправляются/);
+          assert.equal(h.elements.nextCheck.textContent, 'Следующая проверка: —');
+          assert.equal(h.text().includes('SECRET'), false);
+          const balance = h.elements.equity.textContent;
+          await h.refresh(h.fixture({status:'error', updated_at:null, equity:null,
+            execution_mode:'sandbox_auto', automation:{...automation, status:'stopped'}}));
+          assert.equal(h.elements.equity.textContent, balance);
+          assert.equal(h.elements.automationNotice.hidden, false);
+          assert.equal(h.elements.connection.dataset.state, 'stale');
+          await h.refresh(h.fixture({automation:{...automation, enabled:false, status:'stopped'}}));
+          assert.equal(h.elements.hostingNotice.hidden, true);
+          assert.equal(h.elements.automationNotice.hidden, true);
+          assert.equal(h.elements.automationTimes.hidden, true);
+          assert.equal(h.elements.modeTitle.textContent, 'Режим наблюдения');
+        """)
+
+    def test_order_execution_is_claimed_only_for_confirmed_fill(self):
+        self.run_script(r"""
+          const automation = {enabled:true, status:'running', interval_seconds:300,
+            last_checked_at:'2026-10-06T12:00:00Z', next_check_at:'2026-10-06T12:05:00Z',
+            last_result:{action:'buy', reason:'rebalance_buy', lots:2,
+              order_status:'EXECUTION_REPORT_STATUS_NEW'}, error:null};
+          await h.start(h.fixture({execution_mode:'sandbox_auto', automation}));
+          assert.equal(h.elements.action.textContent, 'Покупка в песочнице');
+          assert.equal(h.elements.orderResult.textContent, 'Заявка открыта');
+          assert.equal(h.elements.plannedLots.textContent, 'Заявка, лотов: 2');
+          await h.refresh(h.fixture({execution_mode:'sandbox_auto', automation:{...automation,
+            last_result:{...automation.last_result, order_status:'EXECUTION_REPORT_STATUS_PARTIALLYFILL'}}}));
+          assert.equal(h.elements.action.textContent, 'Покупка в песочнице');
+          assert.equal(h.elements.orderResult.textContent, 'Заявка исполнена частично');
+          await h.refresh(h.fixture({execution_mode:'sandbox_auto', automation:{...automation,
+            last_result:{...automation.last_result, order_status:'EXECUTION_REPORT_STATUS_FILL'}}}));
+          assert.equal(h.elements.action.textContent, 'Куплено в песочнице');
+          assert.equal(h.elements.orderResult.textContent, 'Заявка полностью исполнена');
+          await h.refresh(h.fixture({execution_mode:'sandbox_auto', automation:{...automation,
+            last_result:{...automation.last_result, reason:'weekend_calendar_guard', order_status:null}}}));
+          assert.equal(h.elements.action.textContent, 'План: купить');
+          assert.equal(h.elements.orderResult.hidden, true);
+          assert.equal(h.elements.reason.textContent, 'Сегодня выходной. Стратегия ожидает торгового дня.');
+        """)

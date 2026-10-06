@@ -29,7 +29,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     .metric-label{display:block;font-size:12px;color:#d0dfd2;margin-bottom:8px}.metric-value{font-size:20px;font-weight:550;letter-spacing:-.4px;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}.metric-note{display:block;margin-top:5px;font-size:12px;color:#d0dfd2}
     .signal-top{display:flex;justify-content:space-between;gap:12px;align-items:center}.tag{font-size:11px;background:#f0f3ec;border-radius:6px;color:#536350;padding:5px 7px;white-space:nowrap}
     .action{margin:22px 0 8px;font-size:26px;font-weight:600;letter-spacing:-.6px}.reason{color:#697269;font-size:13px;line-height:1.6;margin:0;min-height:42px}.signal-meta{display:flex;flex-wrap:wrap;gap:8px 18px;margin:18px 0 0;font-size:12px;color:#697269;line-height:1.6}
-    .mode{font-size:12px;color:#52644f;background:#f3f5ef;border-radius:10px;padding:12px 13px;margin-top:18px;line-height:1.65}.mode strong{display:block;color:#334b3b;font-weight:600;margin-bottom:3px}
+    .mode{font-size:12px;color:#52644f;background:#f3f5ef;border-radius:10px;padding:12px 13px;margin-top:18px;line-height:1.65}.mode strong{display:block;color:#334b3b;font-weight:600;margin-bottom:3px}.automation-times{margin-top:10px;padding-top:9px;border-top:1px solid #dfe6d8}.automation-times span{display:block}
     .chart-top{display:flex;align-items:flex-start;justify-content:space-between;gap:18px}.chart-subtitle{font-size:12px;color:#697269;margin:7px 0 0;line-height:1.5}.price{text-align:right;font-size:22px;font-weight:600;font-variant-numeric:tabular-nums;letter-spacing:-.5px;white-space:nowrap}
     .price-label{display:block;font-size:11px;font-weight:400;letter-spacing:0;color:#697269;margin-top:4px}.chart-body{margin-top:24px}.chart-scale{display:flex;justify-content:space-between;color:#697269;font-size:11px;font-variant-numeric:tabular-nums;margin-bottom:6px}.chart-svg{width:100%;height:160px;display:block;overflow:visible}.chart-dates{display:flex;justify-content:space-between;font-size:11px;color:#697269;margin-top:12px;gap:12px}
     .empty{display:flex;align-items:center;justify-content:center;min-height:140px;text-align:center;color:#697269;font-size:13px;line-height:1.65;margin:14px 0 0;padding:12px}.events{list-style:none;margin:20px 0 0;padding:0}.event{display:flex;gap:12px;padding:13px 0;border-bottom:1px solid #edf0e8}.event:first-child{padding-top:0}.event:last-child{padding-bottom:0;border:0}.event-dot{width:7px;height:7px;border-radius:50%;background:#9eb69a;flex-shrink:0;margin-top:6px}.event-label{font-size:13px;line-height:1.5;color:#344735;overflow-wrap:anywhere}.event-time{display:block;font-size:11px;color:#697269;margin-top:5px;line-height:1.5}
@@ -55,6 +55,8 @@ DASHBOARD_HTML = r"""<!doctype html>
       <div id="updatedAt" class="updated">Данные ещё не получены</div>
     </div>
     <div id="notice" class="notice" role="status">Загружаем данные песочницы. Первое подключение может занять немного времени.</div>
+    <div id="hostingNotice" class="notice" hidden>Бесплатный сервер может засыпать. Во время остановки заявки не отправляются.</div>
+    <div id="automationNotice" class="notice" data-tone="error" role="status" hidden>Автоторговля остановлена. Требуется проверка состояния.</div>
     <div class="grid">
       <section class="card portfolio" aria-labelledby="balanceHeading">
         <h2 id="balanceHeading" class="eyebrow">Стоимость виртуального портфеля</h2>
@@ -68,8 +70,8 @@ DASHBOARD_HTML = r"""<!doctype html>
       <section class="card" aria-labelledby="signalHeading">
         <div class="signal-top"><h2 id="signalHeading" class="card-heading">Последний сигнал</h2><span class="tag">SMA 20 / 60</span></div>
         <p id="action" class="action">Ожидаем данные</p><p id="reason" class="reason">Сигнал появится после проверки завершённых дневных свечей.</p>
-        <div class="signal-meta"><span id="signalTime">Время сигнала: —</span><span id="plannedLots" hidden></span></div>
-        <div class="mode"><strong>Режим наблюдения</strong>Проверка по запросу, без фоновой торговли. Отправка заявок с этой страницы не включена.</div>
+        <div class="signal-meta"><span id="signalTime">Время сигнала: —</span><span id="plannedLots" hidden></span><span id="orderResult" hidden></span></div>
+        <div class="mode"><strong id="modeTitle">Режим наблюдения</strong><span id="modeDescription">Проверка по запросу, без фоновой торговли. Отправка заявок с этой страницы не включена.</span><div id="automationTimes" class="automation-times" hidden><span id="lastChecked">Последняя проверка: —</span><span id="nextCheck">Следующая проверка: —</span></div></div>
       </section>
       <section class="card" aria-labelledby="chartHeading">
         <div class="chart-top"><div><h2 id="chartHeading" class="card-heading">Цена SBER</h2><p id="chartSummary" class="chart-subtitle">Завершённые дневные свечи</p></div><div class="price"><span id="price">—</span><span class="price-label">Последняя цена</span></div></div>
@@ -91,7 +93,7 @@ DASHBOARD_HTML = r"""<!doctype html>
         <p id="eventsEmpty" class="empty">Пока нет событий для отображения.</p><ul id="events" class="events" hidden></ul>
       </section>
     </div>
-    <footer class="footer"><p>Только виртуальные средства песочницы Т‑Инвестиций.<br>Результаты не отражают доходность на реальном счёте.</p><p class="footer-right">Время указано по Москве.<br>Автообновление каждые 30 секунд, пока страница открыта.</p></footer>
+    <footer class="footer"><p>Только виртуальные средства песочницы Т‑Инвестиций.<br>Результаты не отражают доходность на реальном счёте.</p><p class="footer-right">Время указано по Москве.<br>Обновление страницы каждые 30 секунд, пока она видна.</p></footer>
   </main>
   <script>
     'use strict';
@@ -101,6 +103,13 @@ DASHBOARD_HTML = r"""<!doctype html>
     const timeFormat = new Intl.DateTimeFormat('ru-RU', {timeZone:'Europe/Moscow', day:'2-digit', month:'short', year:'numeric', hour:'2-digit', minute:'2-digit', second:'2-digit'});
     const dateFormat = new Intl.DateTimeFormat('ru-RU', {timeZone:'Europe/Moscow', day:'2-digit', month:'short', year:'numeric'});
     const actions = {hold:'Удерживать', buy:'План: купить', sell:'План: продать', wait:'Ожидать'};
+    const orderStatuses = {
+      EXECUTION_REPORT_STATUS_FILL:'Заявка полностью исполнена',
+      EXECUTION_REPORT_STATUS_PARTIALLYFILL:'Заявка исполнена частично',
+      EXECUTION_REPORT_STATUS_NEW:'Заявка открыта',
+      EXECUTION_REPORT_STATUS_REJECTED:'Заявка отклонена',
+      EXECUTION_REPORT_STATUS_CANCELLED:'Заявка отменена'
+    };
     const reasons = {
       at_target:'Текущая позиция соответствует сигналу стратегии.',
       rebalance_buy:'Сигнал стратегии предусматривает покупку SBER.',
@@ -118,14 +127,14 @@ DASHBOARD_HTML = r"""<!doctype html>
       insufficient_history:'Недостаточно завершённых свечей для расчёта средних.',
       insufficient_funds_for_lot:'Свободных виртуальных средств недостаточно для одного лота.',
       insufficient_allocation_for_lot:'Размер позиции по правилам стратегии меньше одного лота.',
-      weekend_calendar_guard:'План рассчитан. Отправка приостановлена проверкой торгового дня.',
+      weekend_calendar_guard:'Сегодня выходной. Стратегия ожидает торгового дня.',
       pending_order_uncertain:'Результат предыдущей виртуальной заявки требует проверки.',
       pending_order_open:'Предыдущая виртуальная заявка ещё открыта.',
       active_orders:'В песочнице есть открытая виртуальная заявка. Ожидаем её завершения.',
       active_sandbox_orders:'В песочнице есть открытая виртуальная заявка. Ожидаем её завершения.',
       buying_unavailable:'Покупка SBER сейчас недоступна в песочнице.',
       selling_unavailable:'Продажа SBER сейчас недоступна в песочнице.',
-      pending_order_executed:'Предыдущая виртуальная заявка исполнена.',
+      pending_order_executed:'Предыдущая виртуальная заявка проверена. Статус исполнения показан ниже.',
       pending_order_failed:'Предыдущая виртуальная заявка завершилась без исполнения.',
       submission_uncertain:'Результат отправки виртуальной заявки требует проверки.',
       order_rejected:'Виртуальная заявка отклонена песочницей.',
@@ -237,18 +246,57 @@ DASHBOARD_HTML = r"""<!doctype html>
         list.append(item);
       }
     }
+    function renderAutomation(value) {
+      const automatic = value.execution_mode === 'sandbox_auto';
+      const automation = automatic && value.automation && typeof value.automation === 'object' ? value.automation : null;
+      const active = automation && automation.enabled === true && ['running', 'waiting'].includes(automation.status);
+      byId('hostingNotice').hidden = !automatic;
+      byId('automationNotice').hidden = !automatic || !!active;
+      byId('automationTimes').hidden = !automatic;
+      if (!automatic) {
+        byId('modeTitle').textContent = 'Режим наблюдения';
+        byId('modeDescription').textContent = 'Проверка по запросу, без фоновой торговли. Отправка заявок с этой страницы не включена.';
+        return null;
+      }
+      const interval = automation && Number.isSafeInteger(automation.interval_seconds) && automation.interval_seconds > 0 ? automation.interval_seconds : null;
+      const period = interval === null ? '' : interval % 60 === 0 ? ' · проверка каждые ' + countFormat.format(interval / 60) + ' мин' : ' · проверка каждые ' + countFormat.format(interval) + ' с';
+      byId('modeTitle').textContent = active ? 'Автоторговля в песочнице' + period : 'Автоторговля остановлена';
+      byId('modeDescription').textContent = active ? 'Бот работает на сервере. Закрытие страницы или отключение вашего устройства не останавливает процесс.' : 'Новые виртуальные заявки не отправляются. Для продолжения требуется проверка состояния бота.';
+      byId('lastChecked').textContent = 'Последняя проверка: ' + timestamp(automation && automation.last_checked_at);
+      byId('nextCheck').textContent = 'Следующая проверка: ' + timestamp(automation && automation.next_check_at);
+      return automation && automation.last_result && typeof automation.last_result === 'object' ? automation.last_result : null;
+    }
+    function actionLabel(action, result) {
+      if (result && result.order_status === 'EXECUTION_REPORT_STATUS_FILL') {
+        if (action === 'buy') return 'Куплено в песочнице';
+        if (action === 'sell') return 'Продано в песочнице';
+      }
+      if (result && Object.hasOwn(orderStatuses, result.order_status)) {
+        if (action === 'buy') return 'Покупка в песочнице';
+        if (action === 'sell') return 'Продажа в песочнице';
+      }
+      return Object.hasOwn(actions, action) ? actions[action] : 'Сигнала пока нет';
+    }
     function render(value) {
       byId('equity').textContent = money(value.equity);
       byId('cash').textContent = money(value.cash);
       byId('price').textContent = money(value.price);
       byId('shares').textContent = Number.isSafeInteger(value.shares) && value.shares >= 0 ? countFormat.format(value.shares) + ' шт.' : '—';
       byId('updatedAt').textContent = date(value.updated_at) ? 'Обновлено ' + timestamp(value.updated_at) : 'Время обновления не получено';
-      byId('action').textContent = Object.hasOwn(actions, value.last_action) ? actions[value.last_action] : 'Сигнала пока нет';
-      byId('reason').textContent = Object.hasOwn(reasons, value.action_reason) ? reasons[value.action_reason] : 'Сигнал появится после проверки завершённых дневных свечей.';
-      byId('signalTime').textContent = 'Время сигнала: ' + timestamp(value.signal_time);
-      const lots = Number.isSafeInteger(value.planned_lots) && value.planned_lots > 0 ? value.planned_lots : null;
+      const result = renderAutomation(value);
+      const action = result ? result.action : value.last_action;
+      const reason = result ? result.reason : value.action_reason;
+      byId('signalHeading').textContent = result ? 'Последний шаг бота' : 'Последний сигнал';
+      byId('action').textContent = actionLabel(action, result);
+      byId('reason').textContent = Object.hasOwn(reasons, reason) ? reasons[reason] : 'Сигнал появится после проверки завершённых дневных свечей.';
+      byId('signalTime').textContent = (result ? 'Последняя завершённая свеча: ' : 'Время сигнала: ') + timestamp(value.signal_time);
+      const requestedLots = result ? result.lots : value.planned_lots;
+      const lots = Number.isSafeInteger(requestedLots) && requestedLots > 0 ? requestedLots : null;
       byId('plannedLots').hidden = lots === null;
-      byId('plannedLots').textContent = lots === null ? '' : 'План, лотов: ' + countFormat.format(lots);
+      const hasOrderStatus = result && Object.hasOwn(orderStatuses, result.order_status);
+      byId('plannedLots').textContent = lots === null ? '' : (hasOrderStatus ? 'Заявка, лотов: ' : 'План, лотов: ') + countFormat.format(lots);
+      byId('orderResult').hidden = !hasOrderStatus;
+      byId('orderResult').textContent = hasOrderStatus ? orderStatuses[result.order_status] : '';
       renderChart(value.chart);
       renderEvents(value.events);
     }
@@ -263,12 +311,10 @@ DASHBOARD_HTML = r"""<!doctype html>
         const response = await fetch('/api/status', {method:'GET', cache:'no-store', credentials:'omit', signal:controller.signal});
         if (!response.ok) throw new Error('status_unavailable');
         const value = await response.json();
-        if (!value || !['connected', 'loading', 'error'].includes(value.status) || value.execution_mode !== 'observe_on_demand') throw new Error('invalid_status');
+        if (!value || !['connected', 'loading', 'error'].includes(value.status) || !['observe_on_demand', 'sandbox_auto'].includes(value.execution_mode)) throw new Error('invalid_status');
         refreshFailed = value.status === 'error';
-        if (value.status !== 'error' || date(value.updated_at) || !snapshot) {
-          snapshot = value;
-          render(value);
-        }
+        snapshot = value.status === 'error' && !date(value.updated_at) && snapshot ? {...snapshot, status:value.status, execution_mode:value.execution_mode, automation:value.automation} : value;
+        render(snapshot);
       } catch (_) {
         refreshFailed = true;
       } finally {

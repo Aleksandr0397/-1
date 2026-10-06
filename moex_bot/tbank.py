@@ -334,6 +334,27 @@ class TInvestClient:
     def get_sandbox_orders(self, account_id: str) -> list[dict]:
         return _objects(self._call("SandboxService", "GetSandboxOrders", {"accountId": _identifier(account_id)}), "orders")
 
+    def get_sandbox_operations(self, account_id: str, start: datetime, end: datetime) -> list[dict]:
+        """Read unfiltered account operations for an explicit UTC interval.
+
+        The legacy endpoint returns at most the latest 1000 operations and has
+        no completeness indicator; callers must reject a full 1000-row response
+        when older operations matter. Publication may lag actual execution.
+        Neither an instrument filter nor a state filter is applied, so security
+        activity and any returned cancellations are visible to recovery checks.
+        """
+        account_id = _identifier(account_id)
+        start, end = _utc(start), _utc(end)
+        if start >= end:
+            raise ValueError("Operation start must precede end")
+        result = self._call("SandboxService", "GetSandboxOperations", {
+            "accountId": account_id, "from": _json_time(start), "to": _json_time(end),
+        })
+        operations = _objects(result, "operations")
+        if len(operations) > 1000:
+            raise ApiError("Broker operation history exceeds the supported limit")
+        return operations
+
     def get_sandbox_order_state(self, account_id: str, order_id: str) -> dict:
         """Look up the persisted client request UUID, including after a timeout."""
         return self._call("SandboxService", "GetSandboxOrderState", {"accountId": _identifier(account_id),

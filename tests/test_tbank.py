@@ -137,6 +137,38 @@ class HttpContractTests(unittest.TestCase):
             with self.subTest(response=response), self.assertRaises(ApiError):
                 TInvestClient(SECRET, transport=RecordingTransport(response)).get_last_price("share-uid")
 
+    def test_operations_are_sandbox_only_with_explicit_range_and_no_filters(self):
+        operations = [{"id": "trade", "operationType": "OPERATION_TYPE_BUY"},
+                      {"id": "cancelled", "state": "OPERATION_STATE_CANCELED"}]
+        transport = RecordingTransport({"operations": operations})
+        client = TInvestClient(SECRET, timeout=7, transport=transport)
+        start = datetime(2026, 10, 6, 8, tzinfo=timezone(timedelta(hours=3)))
+        end = datetime(2026, 10, 6, 9, tzinfo=timezone(timedelta(hours=3)))
+        self.assertEqual(client.get_sandbox_operations("account", start, end), operations)
+        self.assert_request(transport, 0, "SandboxService", "GetSandboxOperations", {
+            "accountId": "account", "from": "2026-10-06T05:00:00Z", "to": "2026-10-06T06:00:00Z"})
+
+    def test_operations_range_is_validated_before_network(self):
+        transport = RecordingTransport()
+        client = TInvestClient(SECRET, transport=transport)
+        now = datetime(2026, 10, 6, tzinfo=UTC)
+        for account, start, end in [("", now, now + timedelta(hours=1)),
+                                    ("account", datetime(2026, 10, 6), now),
+                                    ("account", now, now), ("account", now + timedelta(hours=1), now)]:
+            with self.subTest(account=account, start=start, end=end), self.assertRaises(ValueError):
+                client.get_sandbox_operations(account, start, end)
+        self.assertEqual(transport.requests, [])
+
+    def test_operations_omitted_collection_and_response_bound(self):
+        start = datetime(2026, 10, 6, tzinfo=UTC)
+        end = start + timedelta(hours=1)
+        client = TInvestClient(SECRET, transport=RecordingTransport({}, {"operations": [{}] * 1000}))
+        self.assertEqual(client.get_sandbox_operations("account", start, end), [])
+        self.assertEqual(len(client.get_sandbox_operations("account", start, end)), 1000)
+        for response in ({"operations": "bad"}, {"operations": ["bad"]}, {"operations": [{}] * 1001}):
+            with self.subTest(response_type=type(response["operations"])), self.assertRaises(ApiError):
+                TInvestClient(SECRET, transport=RecordingTransport(response)).get_sandbox_operations("account", start, end)
+
     def test_client_inputs_are_validated_before_network(self):
         for kwargs in [{"token": ""}, {"token": "Bearer token"}, {"token": "token\n"},
                        {"token": SECRET, "timeout": 0}, {"token": SECRET, "timeout": float("inf")}, {"token": SECRET, "timeout": True}]:

@@ -256,6 +256,145 @@ class HostedTests(unittest.TestCase):
             with self.subTest(account=account), self.assertRaises(ValueError):
                 replace(self.config, public_monitor_account_id=account)
 
+    def initial_checkpoint(self):
+        return {"action": "hold", "reason": "at_target", "lots": 0, "submit": True,
+                "shares": 0, "halted": False, "equity": "100000", "cash": "100000",
+                "high_water": "100000", "drawdown": "0", "price": "100",
+                "signal_time": "2026-10-05T00:00:00+00:00"}
+
+    def restored_state(self):
+        return {"version": 1, "identity": {"account_id": MONITOR_ACCOUNT, "ticker": "SBER",
+                "uid": "share-uid", "lot": 10, "strategy": "sma-entry-hold-v1", "fast": 20,
+                "slow": 60, "max_allocation": "0.2", "max_drawdown": "0.1", "commission": "0.0005"},
+                "high_water": "100000", "halted": False, "pending": None,
+                "handled_signal": None, "risk_handled_signal": None,
+                "failed_signal": None, "risk_failed_signal": None}
+
+    def restore_parameters(self):
+        return {"created_at": "2026-10-06T05:52:37+00:00", "checkpoint": self.initial_checkpoint()}
+
+    def test_restore_is_authorized_explicit_and_only_accepts_initial_untraded_checkpoint(self):
+        self.enable_monitor()
+        status, _ = self.api("/api/restore", self.restore_parameters(), authenticated=False)
+        self.assertEqual(status, 401)
+        self.factory.assert_not_called()
+        for field, value in (("shares", 10), ("halted", True), ("cash", "99999"),
+                             ("high_water", "100001"), ("order_id", "old-order")):
+            parameters = self.restore_parameters()
+            parameters["checkpoint"][field] = value
+            status, report = self.api("/api/restore", parameters)
+            self.assertEqual((status, report["error"]), (400, "invalid_restore_checkpoint"))
+        self.factory.assert_not_called()
+
+    def test_restore_writes_complete_state_once_and_never_resets_existing_history(self):
+        self.enable_monitor()
+        with patch("moex_bot.hosted.restore_cash_account", return_value=self.restored_state()) as restore:
+            status, report = self.api("/api/restore", self.restore_parameters())
+            self.assertEqual((status, report["restored"]), (200, True))
+            self.assertTrue(restore.call_args.kwargs["prior_checkpoint_trusted"])
+            state = self.stored()
+            self.assertTrue(state["trading_state_started"])
+            self.assertEqual(self.control._trading_state(state), self.restored_state())
+            status, report = self.api("/api/restore", self.restore_parameters())
+            self.assertEqual((status, report["error"]), (409, "restore_requires_empty_local_state"))
+            restore.assert_called_once()
+        self.assertFalse(self.client.calls)
+
+    def test_interrupted_restore_blocks_trade_and_future_restore(self):
+        self.enable_monitor()
+        with patch("moex_bot.hosted.restore_cash_account", return_value={"bad": "state"}):
+            status, _ = self.api("/api/restore", self.restore_parameters())
+            self.assertEqual(status, 409)
+        self.assertEqual(self.stored()["stage"], "restoring")
+        self.factory.reset_mock()
+        for path, parameters in (("/api/step", {"submit": True}), ("/api/restore", self.restore_parameters())):
+            status, _ = self.api(path, parameters)
+            self.assertEqual(status, 409)
+        self.factory.assert_not_called()
+
+    def test_automatic_start_halts_missing_state_before_any_broker_request(self):
+        self.stop_all()
+        self.config = replace(self.config, public_monitor_account_id=MONITOR_ACCOUNT, auto_trade=True)
+        self.start()
+        self.assertTrue(self.control.start_auto())
+        deadline = time.monotonic() + 2
+        while self.control.automatic.public_status()["status"] != "error" and time.monotonic() < deadline:
+            threading.Event().wait(.005)
+        report = self.control.automatic.public_status()
+        self.assertEqual((report["status"], report["error"]), ("error", "automatic_state_not_ready"))
+        self.factory.assert_not_called()
+        self.assertFalse(self.control.trading_path.exists())
+
+    def test_automatic_tick_uses_restored_state_and_requires_submission_explicitly(self):
+        self.stop_all()
+        self.config = replace(self.config, public_monitor_account_id=MONITOR_ACCOUNT, auto_trade=True)
+        self.start()
+        with patch("moex_bot.hosted.restore_cash_account", return_value=self.restored_state()):
+            self.assertEqual(self.api("/api/restore", self.restore_parameters())[0], 200)
+        result = {"action": "hold", "reason": "at_target", "lots": 0}
+        with patch("moex_bot.hosted.run_step", return_value=result) as step:
+            self.control.start_auto()
+            deadline = time.monotonic() + 2
+            while self.control.automatic.public_status()["last_result"] is None and time.monotonic() < deadline:
+                threading.Event().wait(.005)
+            self.assertEqual(self.control.automatic.public_status()["last_result"]["action"], "hold")
+            step.assert_called_once_with(self.client, MONITOR_ACCOUNT, "SBER", state_path=self.control.trading_path, submit=True)
+        self.control.automatic.stop()
+        status = self.control.public_status()
+        self.assertEqual(status["execution_mode"], "sandbox_auto")
+        self.assertTrue(status["automation"]["enabled"])
+        self.assertNotIn(MONITOR_ACCOUNT, json.dumps(status))
+
+    def test_automatic_private_resume_revalidates_state_and_stop_remains_authorized(self):
+        self.enable_monitor()
+        for path in ("/api/auto-resume", "/api/auto-stop"):
+            self.assertEqual(self.api(path, authenticated=False)[0], 401)
+            self.assertEqual(self.api(path, {"account_id": MONITOR_ACCOUNT})[0], 400)
+        self.assertEqual(self.api("/api/auto-resume")[0], 409)
+        self.factory.assert_not_called()
+
+    def test_automatic_rejects_future_saved_signal_before_broker_access(self):
+        self.enable_monitor()
+        with patch("moex_bot.hosted.restore_cash_account", return_value=self.restored_state()):
+            self.assertEqual(self.api("/api/restore", self.restore_parameters())[0], 200)
+        state = self.restored_state()
+        state["handled_signal"] = "2050-01-01T00:00:00+00:00"
+        with sqlite3.connect(self.control.trading_path) as database:
+            database.execute("UPDATE bot_state SET data=? WHERE id=1", (json.dumps(state),))
+        self.factory.reset_mock()
+        with self.assertRaises(Exception) as error:
+            self.control._automatic_step()
+        self.assertEqual(error.exception.code, "trading_state_invalid_manual_review_required")
+        self.factory.assert_not_called()
+
+    def test_shutdown_drains_manual_request_and_rejects_new_work_before_releasing_ownership(self):
+        entered, release = threading.Event(), threading.Event()
+        def blocked_check():
+            entered.set()
+            release.wait(2)
+        self.client.check_hook = blocked_check
+        caller = threading.Thread(target=lambda: self.api("/api/check"))
+        caller.start()
+        self.assertTrue(entered.wait(1))
+        closing = threading.Thread(target=self.control.close)
+        closing.start()
+        deadline = time.monotonic() + 1
+        while not self.control._closed and time.monotonic() < deadline:
+            threading.Event().wait(.005)
+        try:
+            self.assertTrue(closing.is_alive())
+            self.assertFalse(self.control.start_auto())
+            for path in ("/api/check", "/api/auto-resume"):
+                self.assertEqual(self.api(path)[0], 503)
+            with self.assertRaises(sqlite3.OperationalError):
+                HostedControl(self.config, self.factory)
+        finally:
+            release.set()
+            caller.join(2)
+            closing.join(2)
+        self.assertFalse(closing.is_alive())
+        self.control.close()  # Idempotent after the drain is complete.
+
     def test_unauthenticated_sensitive_operations_fail_before_network(self):
         for path in ("/api/check", "/api/connect", "/api/step"):
             with self.subTest(path=path):

@@ -26,8 +26,10 @@ import time
 from typing import Callable
 from uuid import UUID
 
+from .autorun import SandboxAutoRunner
 from .dashboard import DASHBOARD_HTML
 from .monitor import MonitorError, collect
+from .restore import RestoreError, restore_cash_account
 from .sandbox import MOEX_TZ, run_step
 from .tbank import ApiError, TInvestClient, money, quotation
 
@@ -51,6 +53,8 @@ class HostedConfig:
     # Explicit publication of this dedicated virtual account only. This does
     # not restore a lost trading session or authorize any broker mutations.
     public_monitor_account_id: str | None = field(default=None, repr=False)
+    auto_trade: bool = False
+    auto_interval: int = 300
 
     def __post_init__(self) -> None:
         if (not isinstance(self.control_token, str)
@@ -71,6 +75,10 @@ class HostedConfig:
         quotation(self.initial_cash)
         if not isinstance(self.state_dir, Path) or str(self.state_dir) == ":memory:":
             raise ValueError("Private local state directory is required")
+        if type(self.auto_trade) is not bool or type(self.auto_interval) is not int or not 30 <= self.auto_interval <= 86400:
+            raise ValueError("Invalid automatic sandbox configuration")
+        if self.auto_trade and self.public_monitor_account_id is None:
+            raise ValueError("An explicit sandbox account is required for automatic execution")
         if self.public_monitor_account_id is not None:
             try:
                 if str(UUID(self.public_monitor_account_id)) != self.public_monitor_account_id:
@@ -81,12 +89,17 @@ class HostedConfig:
     @classmethod
     def from_environment(cls) -> HostedConfig:
         # Hosted operation intentionally never falls back to a local token file.
+        auto_text = os.environ.get("BOT_AUTOTRADE_ENABLED", "false")
+        interval_text = os.environ.get("BOT_AUTOTRADE_INTERVAL", "300")
+        if auto_text not in {"true", "false"} or not re.fullmatch(r"[0-9]{1,5}", interval_text, re.ASCII):
+            raise ValueError("Invalid automatic sandbox environment")
         return cls(control_token=os.environ.get("BOT_CONTROL_TOKEN", ""),
                    sandbox_token=os.environ.get("TINVEST_SANDBOX_TOKEN", ""),
                    ticker=os.environ.get("BOT_TICKER", "SBER").upper(),
                    initial_cash=Decimal(os.environ.get("BOT_INITIAL_CASH", "100000")),
                    state_dir=Path(os.environ.get("BOT_STATE_DIR", "state/hosted")),
-                   public_monitor_account_id=os.environ.get("BOT_PUBLIC_MONITOR_ACCOUNT_ID") or None)
+                   public_monitor_account_id=os.environ.get("BOT_PUBLIC_MONITOR_ACCOUNT_ID") or None,
+                   auto_trade=auto_text == "true", auto_interval=int(interval_text))
 
 
 class _ControlError(Exception):
@@ -139,11 +152,13 @@ class HostedControl:
         self.connection_path = self.state_dir / "connection.sqlite3"
         self.trading_path = self.state_dir / "trading.sqlite3"
         self._requests = threading.Lock()
+        self._lifecycle_lock = threading.Lock()
         self._monitor_lock = threading.Lock()
         self._monitor_snapshot: dict | None = None
         self._monitor_checked = float("-inf")
         self._monitor_running = False
         self._closed = False
+        self._close_done = threading.Event()
         self._client_factory = client_factory or (lambda: TInvestClient(config.sandbox_token, timeout=_BROKER_TIMEOUT))
         self._lifetime_lock = _private_database(self.state_dir / "service.lock.sqlite3")
         try:
@@ -155,11 +170,60 @@ class HostedControl:
         except Exception:
             self._lifetime_lock.close()
             raise
+        self.automatic = SandboxAutoRunner(self._automatic_step, enabled=config.auto_trade,
+                                          interval=config.auto_interval)
 
     def close(self) -> None:
-        with self._monitor_lock:
-            self._closed = True
-        self._lifetime_lock.close()
+        with self._lifecycle_lock:
+            already_closing = self._closed
+            with self._monitor_lock:
+                self._closed = True
+        if already_closing:
+            self._close_done.wait()
+            return
+        # Closing rejects new work before draining both background and manual
+        # broker requests. Retain lifetime ownership through their completion.
+        try:
+            self.automatic.stop()
+            with self._requests:
+                self._lifetime_lock.close()
+        finally:
+            self._close_done.set()
+
+    def start_auto(self) -> bool:
+        with self._lifecycle_lock:
+            if self._closed:
+                return False
+            return self.automatic.start()
+
+    def _automatic_state(self) -> dict:
+        state = self._load()
+        if state is None or state["stage"] != "ready" or state.get("trading_state_started") is not True:
+            raise _ControlError(409, "automatic_state_not_ready")
+        if self._account(state) != self.config.public_monitor_account_id:
+            raise _ControlError(409, "monitor_account_mismatch")
+        self._trading_state(state)
+        return state
+
+    def _automatic_step(self) -> tuple[int, dict]:
+        if not self._requests.acquire(blocking=False):
+            raise _ControlError(409, "operation_in_progress")
+        try:
+            if self._closed:
+                raise _ControlError(503, "service_stopping")
+            self._automatic_state()  # Never initialize or reset state in a tick.
+            return self._step(True)
+        finally:
+            self._requests.release()
+
+    def _with_automation(self, report: dict) -> dict:
+        status = self.automatic.public_status()
+        return {**report, "execution_mode": "sandbox_auto" if self.config.auto_trade else "observe_on_demand",
+                "automation": {"enabled": status["enabled"], "status": status["status"],
+                               "interval_seconds": status["interval_seconds"],
+                               "last_checked_at": status["last_completed_at"],
+                               "next_check_at": status["next_run_at"],
+                               "last_result": status["last_result"], "error": status["error"]}}
 
     def _empty_monitor(self, status: str, error: str | None = None) -> dict:
         return {"status": status, "ticker": self.config.ticker,
@@ -171,21 +235,23 @@ class HostedControl:
     def public_status(self) -> dict:
         """Schedule a bounded read-only refresh; HTTP requests never wait on API."""
         if self.config.public_monitor_account_id is None:
-            return self._empty_monitor("error", "monitor_not_configured")
+            return self._with_automation(self._empty_monitor("error", "monitor_not_configured"))
         with self._monitor_lock:
             if self._closed:
-                return self._empty_monitor("error", "monitor_unavailable")
+                return self._with_automation(self._empty_monitor("error", "monitor_unavailable"))
             if not self._monitor_running and time.monotonic() - self._monitor_checked >= _MONITOR_INTERVAL:
                 self._monitor_running = True
                 worker = threading.Thread(target=self._refresh_monitor, daemon=True)
                 worker.start()
-            return self._monitor_snapshot or self._empty_monitor("loading")
+            return self._with_automation(self._monitor_snapshot or self._empty_monitor("loading"))
 
     def _refresh_monitor(self) -> None:
         acquired = self._requests.acquire(blocking=False)
         try:
             if not acquired:
                 raise MonitorError("operation_in_progress")
+            if self._closed:
+                raise MonitorError("broker_unavailable")
             report = collect(self._client_factory(), self.config.public_monitor_account_id,
                              self.config.ticker)
             label = "Данные виртуального счёта обновлены"
@@ -263,7 +329,8 @@ class HostedControl:
             return False
         try:
             time = datetime.fromisoformat(value)
-            return time.tzinfo is not None and time.utcoffset() is not None
+            return (time.tzinfo is not None and time.utcoffset() is not None
+                    and time <= datetime.now(timezone.utc))
         except ValueError:
             return False
 
@@ -428,7 +495,71 @@ class HostedControl:
         self.trading_path.chmod(0o600)
         return 200, {"sandbox_only": True, "result": result}
 
+    def _restore(self, parameters: dict) -> tuple[int, dict]:
+        """Explicit operator recovery of the documented, never-traded account."""
+        account = self.config.public_monitor_account_id
+        if account is None or self._load() is not None or self.trading_path.exists() or self.trading_path.is_symlink():
+            raise _ControlError(409, "restore_requires_empty_local_state")
+        checkpoint = parameters["checkpoint"]
+        expected = {"action": "hold", "reason": "at_target", "lots": 0,
+                    "submit": True, "shares": 0, "halted": False}
+        allowed = set(expected) | {"equity", "cash", "high_water", "drawdown", "signal_time", "price"}
+        try:
+            if (not isinstance(checkpoint, dict) or set(checkpoint) != allowed
+                    or any(type(checkpoint[key]) is not type(value) or checkpoint[key] != value
+                           for key, value in expected.items())
+                    or not self._signal_time(checkpoint["signal_time"])):
+                raise ValueError("Invalid checkpoint")
+            for field in ("equity", "cash", "high_water"):
+                value = checkpoint[field]
+                if not isinstance(value, str) or len(value) > 100 or Decimal(value) != self.config.initial_cash:
+                    raise ValueError("Noninitial checkpoint")
+            if (not isinstance(checkpoint["drawdown"], str) or len(checkpoint["drawdown"]) > 100
+                    or Decimal(checkpoint["drawdown"]) != 0):
+                raise ValueError("Invalid risk checkpoint")
+            created = datetime.fromisoformat(parameters["created_at"])
+            signal = datetime.fromisoformat(checkpoint["signal_time"])
+            now = datetime.now(timezone.utc)
+            if created.tzinfo is None or created > now or signal > created:
+                raise ValueError("Invalid checkpoint times")
+        except (ValueError, TypeError, ArithmeticError):
+            raise _ControlError(400, "invalid_restore_checkpoint") from None
+        try:
+            restored = restore_cash_account(self._client_factory(), account, self.config.ticker,
+                                            self.config.initial_cash, created, now,
+                                            prior_checkpoint_trusted=True)
+        except RestoreError as error:
+            raise _ControlError(409, error.code) from None
+        state = {"identity": self._identity(), "stage": "restoring", "account_id": account,
+                 "trading_state_started": False}
+        self._save(state)  # A crash during the local restore must not reset risk.
+        with _database(self.trading_path) as database:
+            database.execute("CREATE TABLE bot_state(id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL)")
+            database.execute("INSERT INTO bot_state(id,data) VALUES(1,?)",
+                             (json.dumps(restored, sort_keys=True),))
+        baseline = self._trading_state(state)
+        state.update(stage="ready", trading_state_started=True, trading_identity=baseline["identity"])
+        self._save(state)
+        return 200, {"sandbox_only": True, "restored": True, "automatic_started": False}
+
+    def _resume_auto(self) -> tuple[int, dict]:
+        with self._lifecycle_lock:
+            if self._closed:
+                raise _ControlError(503, "service_stopping")
+            if not self.config.auto_trade:
+                raise _ControlError(409, "automatic_mode_not_enabled")
+            if not self._requests.acquire(blocking=False):
+                raise _ControlError(409, "operation_in_progress")
+            try:
+                self._automatic_state()
+            finally:
+                self._requests.release()
+            started = self.automatic.resume()
+            return 200, {"sandbox_only": True, "automatic_started": started}
+
     def execute(self, path: str, parameters: dict) -> tuple[int, dict]:
+        if self._closed:
+            raise _ControlError(503, "service_stopping")
         if path == "/api/check":
             if set(parameters) - {"market_data"} or not isinstance(parameters.get("market_data", False), bool):
                 raise _ControlError(400, "invalid_parameters")
@@ -438,15 +569,28 @@ class HostedControl:
         elif path == "/api/step":
             if set(parameters) != {"submit"} or not isinstance(parameters["submit"], bool):
                 raise _ControlError(400, "explicit_boolean_submit_required")
+        elif path == "/api/restore":
+            if set(parameters) != {"created_at", "checkpoint"} or not isinstance(parameters["created_at"], str):
+                raise _ControlError(400, "explicit_restore_checkpoint_required")
+        elif path in {"/api/auto-resume", "/api/auto-stop"}:
+            if parameters:
+                raise _ControlError(400, "invalid_parameters")
+            if path == "/api/auto-resume":
+                return self._resume_auto()
+            return 200, {"sandbox_only": True, "automatic_stopped": self.automatic.stop(timeout=0)}
         else:
             raise _ControlError(404, "not_found")
         if not self._requests.acquire(blocking=False):
             raise _ControlError(409, "operation_in_progress")
         try:
+            if self._closed:
+                raise _ControlError(503, "service_stopping")
             if path == "/api/check":
                 return self._check(parameters.get("market_data", False))
             if path == "/api/connect":
                 return self._connect()
+            if path == "/api/restore":
+                return self._restore(parameters)
             return self._step(parameters["submit"])
         finally:
             self._requests.release()
@@ -567,6 +711,7 @@ def main() -> int:
             raise ValueError("Invalid port")
         control = HostedControl(config)
         server = HostedServer(("0.0.0.0", int(port_text)), control)
+        control.start_auto()
         print("Hosted sandbox control service is running.", flush=True)
         server.serve_forever(poll_interval=0.5)
         return 0
