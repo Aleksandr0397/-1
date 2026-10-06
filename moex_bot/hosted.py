@@ -557,6 +557,44 @@ class HostedControl:
             started = self.automatic.resume()
             return 200, {"sandbox_only": True, "automatic_started": started}
 
+    def _restore_history(self, created_at: str) -> tuple[int, dict]:
+        """Authenticated diagnostic reads for the configured sandbox only."""
+        account = self.config.public_monitor_account_id
+        if account is None:
+            raise _ControlError(409, "monitor_not_configured")
+        try:
+            created = datetime.fromisoformat(created_at)
+            now = datetime.now(timezone.utc)
+            if created.tzinfo is None or created > now:
+                raise ValueError("Invalid time")
+        except (ValueError, TypeError):
+            raise _ControlError(400, "invalid_restore_checkpoint") from None
+        rows = self._client_factory().get_sandbox_operations(account, created - timedelta(minutes=1), now)
+        def amount(value):
+            if not isinstance(value, dict):
+                return None
+            try:
+                currency = value.get("currency")
+                return {"value": str(money(value)), "currency": currency if currency in {"rub", "RUB"} else "other"}
+            except Exception:
+                return None
+        result = []
+        for row in rows[:50]:
+            kind, state = row.get("operationType"), row.get("state")
+            result.append({"operation_type": kind if isinstance(kind, str) and re.fullmatch(r"OPERATION_TYPE_[A-Z_]{1,64}", kind) else "unknown",
+                           "state": state if isinstance(state, str) and re.fullmatch(r"OPERATION_STATE_[A-Z_]{1,64}", state) else "unknown",
+                           "payment": amount(row.get("payment")), "price": amount(row.get("price")),
+                           "quantity": row.get("quantity") if isinstance(row.get("quantity"), (str, int)) and re.fullmatch(r"[0-9]{1,19}", str(row.get("quantity"))) else None,
+                           "quantity_rest": row.get("quantityRest") if isinstance(row.get("quantityRest"), (str, int)) and re.fullmatch(r"[0-9]{1,19}", str(row.get("quantityRest"))) else None,
+                           "instrument_type": row.get("instrumentType") if row.get("instrumentType") in {"currency", "share", "bond", "etf", "futures", "option", ""} else "unknown",
+                           "rub_figi": row.get("figi") == "RUB000UTSTOM",
+                           "has_figi": bool(row.get("figi")), "has_instrument_uid": bool(row.get("instrumentUid")),
+                           "has_parent": bool(row.get("parentOperationId")),
+                           "has_position_uid": bool(row.get("positionUid")), "has_asset_uid": bool(row.get("assetUid")),
+                           "trades_count": len(row.get("trades", [])) if isinstance(row.get("trades", []), list) else None,
+                           "child_operations_count": len(row.get("childOperations", [])) if isinstance(row.get("childOperations", []), list) else None})
+        return 200, {"sandbox_only": True, "operation_count": len(rows), "operations": result}
+
     def execute(self, path: str, parameters: dict) -> tuple[int, dict]:
         if self._closed:
             raise _ControlError(503, "service_stopping")
@@ -572,6 +610,9 @@ class HostedControl:
         elif path == "/api/restore":
             if set(parameters) != {"created_at", "checkpoint"} or not isinstance(parameters["created_at"], str):
                 raise _ControlError(400, "explicit_restore_checkpoint_required")
+        elif path == "/api/restore-history":
+            if set(parameters) != {"created_at"} or not isinstance(parameters["created_at"], str):
+                raise _ControlError(400, "invalid_parameters")
         elif path in {"/api/auto-resume", "/api/auto-stop"}:
             if parameters:
                 raise _ControlError(400, "invalid_parameters")
@@ -591,6 +632,8 @@ class HostedControl:
                 return self._connect()
             if path == "/api/restore":
                 return self._restore(parameters)
+            if path == "/api/restore-history":
+                return self._restore_history(parameters["created_at"])
             return self._step(parameters["submit"])
         finally:
             self._requests.release()

@@ -395,6 +395,24 @@ class HostedTests(unittest.TestCase):
         self.assertFalse(closing.is_alive())
         self.control.close()  # Idempotent after the drain is complete.
 
+    def test_restore_history_diagnostics_are_private_readonly_and_omit_identifiers(self):
+        self.enable_monitor()
+        self.client.get_sandbox_operations = Mock(return_value=[{
+            "operationType": "OPERATION_TYPE_INPUT", "state": "OPERATION_STATE_EXECUTED",
+            "payment": rub("100000"), "price": rub("0"), "quantity": "0", "quantityRest": "0",
+            "instrumentType": "currency", "figi": "RUB000UTSTOM", "instrumentUid": BROKER_SECRET,
+            "id": MONITOR_ACCOUNT, "description": CONTROL_SECRET, "trades": [], "childOperations": []}])
+        parameters = {"created_at": "2026-10-06T05:52:37+00:00"}
+        self.assertEqual(self.api("/api/restore-history", parameters, authenticated=False)[0], 401)
+        self.client.get_sandbox_operations.assert_not_called()
+        status, report = self.api("/api/restore-history", parameters)
+        self.assertEqual((status, report["operation_count"]), (200, 1))
+        self.assertEqual(report["operations"][0]["payment"]["value"], "100000")
+        for private in (MONITOR_ACCOUNT, CONTROL_SECRET, BROKER_SECRET):
+            self.assertNotIn(private, json.dumps(report))
+        self.assertEqual(self.client.calls, [])
+        self.assertIsNone(self.stored())
+
     def test_unauthenticated_sensitive_operations_fail_before_network(self):
         for path in ("/api/check", "/api/connect", "/api/step"):
             with self.subTest(path=path):
