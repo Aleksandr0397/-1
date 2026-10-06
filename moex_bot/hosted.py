@@ -2,8 +2,8 @@
 
 There is no startup account creation, background trader, token-file reader, or
 real-money API. Lost/uncertain initialization state requires manual inspection.
-Free hosting can lose its local disk; a new explicit connection then creates a
-new virtual account instead of guessing ownership of an existing one.
+Free hosting can lose its local disk. An explicitly configured public monitor
+can still read its virtual account, but never resets the lost trading session.
 """
 
 from __future__ import annotations
@@ -22,9 +22,12 @@ import socket
 import sqlite3
 import sys
 import threading
+import time
 from typing import Callable
 from uuid import UUID
 
+from .dashboard import DASHBOARD_HTML
+from .monitor import MonitorError, collect
 from .sandbox import MOEX_TZ, run_step
 from .tbank import ApiError, TInvestClient, money, quotation
 
@@ -34,7 +37,7 @@ _CONTROL_PATTERN = re.compile(r"[A-Za-z0-9_-]{32,256}\Z", re.ASCII)
 _TICKER_PATTERN = re.compile(r"[A-Z0-9]{1,12}\Z", re.ASCII)
 _BROKER_TIMEOUT = 10
 _PUBLIC_HEALTH = {"ok": True, "service": "moex-sandbox-control"}
-_PUBLIC_PAGE = b"<!doctype html><html lang='en'><title>Sandbox control</title><body><h1>Sandbox control service</h1><p>Service is running. Virtual funds only.</p></body></html>"
+_MONITOR_INTERVAL = 30
 _SIGNAL_FIELDS = {"handled_signal", "risk_handled_signal", "failed_signal", "risk_failed_signal"}
 
 
@@ -45,6 +48,9 @@ class HostedConfig:
     ticker: str = "SBER"
     initial_cash: Decimal = Decimal("100000")
     state_dir: Path = Path("state/hosted")
+    # Explicit publication of this dedicated virtual account only. This does
+    # not restore a lost trading session or authorize any broker mutations.
+    public_monitor_account_id: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if (not isinstance(self.control_token, str)
@@ -65,6 +71,12 @@ class HostedConfig:
         quotation(self.initial_cash)
         if not isinstance(self.state_dir, Path) or str(self.state_dir) == ":memory:":
             raise ValueError("Private local state directory is required")
+        if self.public_monitor_account_id is not None:
+            try:
+                if str(UUID(self.public_monitor_account_id)) != self.public_monitor_account_id:
+                    raise ValueError("Noncanonical account identifier")
+            except (ValueError, AttributeError, TypeError):
+                raise ValueError("Invalid configured monitor account") from None
 
     @classmethod
     def from_environment(cls) -> HostedConfig:
@@ -73,7 +85,8 @@ class HostedConfig:
                    sandbox_token=os.environ.get("TINVEST_SANDBOX_TOKEN", ""),
                    ticker=os.environ.get("BOT_TICKER", "SBER").upper(),
                    initial_cash=Decimal(os.environ.get("BOT_INITIAL_CASH", "100000")),
-                   state_dir=Path(os.environ.get("BOT_STATE_DIR", "state/hosted")))
+                   state_dir=Path(os.environ.get("BOT_STATE_DIR", "state/hosted")),
+                   public_monitor_account_id=os.environ.get("BOT_PUBLIC_MONITOR_ACCOUNT_ID") or None)
 
 
 class _ControlError(Exception):
@@ -126,6 +139,11 @@ class HostedControl:
         self.connection_path = self.state_dir / "connection.sqlite3"
         self.trading_path = self.state_dir / "trading.sqlite3"
         self._requests = threading.Lock()
+        self._monitor_lock = threading.Lock()
+        self._monitor_snapshot: dict | None = None
+        self._monitor_checked = float("-inf")
+        self._monitor_running = False
+        self._closed = False
         self._client_factory = client_factory or (lambda: TInvestClient(config.sandbox_token, timeout=_BROKER_TIMEOUT))
         self._lifetime_lock = _private_database(self.state_dir / "service.lock.sqlite3")
         try:
@@ -139,7 +157,57 @@ class HostedControl:
             raise
 
     def close(self) -> None:
+        with self._monitor_lock:
+            self._closed = True
         self._lifetime_lock.close()
+
+    def _empty_monitor(self, status: str, error: str | None = None) -> dict:
+        return {"status": status, "ticker": self.config.ticker,
+                "execution_mode": "observe_on_demand", "updated_at": None,
+                "signal_time": None, "equity": None, "cash": None, "price": None,
+                "shares": None, "last_action": None, "action_reason": None,
+                "planned_lots": None, "chart": [], "events": [], "error": error}
+
+    def public_status(self) -> dict:
+        """Schedule a bounded read-only refresh; HTTP requests never wait on API."""
+        if self.config.public_monitor_account_id is None:
+            return self._empty_monitor("error", "monitor_not_configured")
+        with self._monitor_lock:
+            if self._closed:
+                return self._empty_monitor("error", "monitor_unavailable")
+            if not self._monitor_running and time.monotonic() - self._monitor_checked >= _MONITOR_INTERVAL:
+                self._monitor_running = True
+                worker = threading.Thread(target=self._refresh_monitor, daemon=True)
+                worker.start()
+            return self._monitor_snapshot or self._empty_monitor("loading")
+
+    def _refresh_monitor(self) -> None:
+        acquired = self._requests.acquire(blocking=False)
+        try:
+            if not acquired:
+                raise MonitorError("operation_in_progress")
+            report = collect(self._client_factory(), self.config.public_monitor_account_id,
+                             self.config.ticker)
+            label = "Данные виртуального счёта обновлены"
+        except Exception as error:
+            # Keep the last verified values and their original timestamp when
+            # a refresh fails. Broker text, IDs and secrets never enter JSON.
+            code = error.code if isinstance(error, MonitorError) else "monitor_refresh_failed"
+            with self._monitor_lock:
+                report = dict(self._monitor_snapshot or self._empty_monitor("error"))
+            report.update(status="error", error=code)
+            label = "Не удалось обновить данные"
+        finally:
+            if acquired:
+                self._requests.release()
+        with self._monitor_lock:
+            events = list((self._monitor_snapshot or {}).get("events", []))
+            events.append({"time": datetime.now(timezone.utc).isoformat(), "label": label})
+            report["events"] = events[-12:]
+            if not self._closed:
+                self._monitor_snapshot = report
+            self._monitor_checked = time.monotonic()
+            self._monitor_running = False
 
     def authorized(self, authorization: str | None) -> bool:
         if not isinstance(authorization, str) or not authorization.isascii():
@@ -302,6 +370,11 @@ class HostedControl:
 
     def _connect(self) -> tuple[int, dict]:
         state = self._load()
+        if self.config.public_monitor_account_id is not None:
+            if state is None:
+                raise _ControlError(409, "configured_monitor_account_readonly")
+            if self._account(state) != self.config.public_monitor_account_id:
+                raise _ControlError(409, "monitor_account_mismatch")
         if state is not None:
             if state["stage"] != "ready":
                 raise _ControlError(409, "initialization_outcome_uncertain_manual_review_required")
@@ -428,6 +501,9 @@ class HostedHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(encoded)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'")
         self.send_header("Connection", "close")
         self.end_headers()
         self.close_connection = True
@@ -440,7 +516,9 @@ class HostedHandler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self._response(200, _PUBLIC_HEALTH)
         elif self.path == "/":
-            self._response(200, _PUBLIC_PAGE, "text/html; charset=utf-8")
+            self._response(200, DASHBOARD_HTML, "text/html; charset=utf-8")
+        elif self.path == "/api/status":
+            self._response(200, self.server.control.public_status())
         else:
             self._response(405 if self.path.startswith("/api/") else 404, {"error": "post_required" if self.path.startswith("/api/") else "not_found"})
 

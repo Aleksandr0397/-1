@@ -1,4 +1,5 @@
 from contextlib import redirect_stderr
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import http.client
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -22,6 +24,7 @@ from moex_bot.tbank import ApiError, quotation
 
 CONTROL_SECRET = "0123456789abcdef" * 4
 BROKER_SECRET = "sandbox-test-private-broker-token"
+MONITOR_ACCOUNT = "11111111-2222-4333-8444-555555555555"
 
 
 def rub(amount):
@@ -161,10 +164,97 @@ class HostedTests(unittest.TestCase):
             with self.subTest(path=path):
                 status, body = self.request(path, method="GET", authenticated=False)
                 self.assertEqual(status, 200)
-                for private in (CONTROL_SECRET, BROKER_SECRET, "SBER", "100000", "account", str(self.control.state_dir)):
+                for private in (CONTROL_SECRET, BROKER_SECRET, MONITOR_ACCOUNT, "100000", str(self.control.state_dir)):
                     self.assertNotIn(private, body)
         self.assertIsNone(self.stored())
         self.factory.assert_not_called()
+
+    def enable_monitor(self):
+        self.stop_all()
+        self.config = replace(self.config, public_monitor_account_id=MONITOR_ACCOUNT)
+        self.start()
+
+    def await_monitor(self):
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            with self.control._monitor_lock:
+                if not self.control._monitor_running:
+                    return self.control._monitor_snapshot
+            threading.Event().wait(0.005)
+        self.fail("Monitor refresh did not finish")
+
+    def monitor_report(self):
+        return {"status": "connected", "ticker": "SBER", "execution_mode": "observe_on_demand",
+                "updated_at": "2026-10-06T06:00:00+00:00", "signal_time": "2026-10-05T00:00:00+00:00",
+                "equity": "100000", "cash": "100000", "price": "283.10", "shares": 0,
+                "last_action": "hold", "action_reason": "at_target", "planned_lots": 0,
+                "chart": [{"time": "2026-10-05T00:00:00+00:00", "price": "283"}],
+                "events": [], "error": None}
+
+    def test_monitor_is_explicit_opt_in_and_default_status_has_no_broker_calls(self):
+        status, report = self.api("/api/status", method="GET", authenticated=False)
+        self.assertEqual(status, 200)
+        self.assertEqual(report["error"], "monitor_not_configured")
+        self.assertIsNone(report["equity"])
+        self.factory.assert_not_called()
+
+    def test_monitor_public_get_refreshes_once_without_recreating_trading_state(self):
+        self.enable_monitor()
+        with patch("moex_bot.hosted.collect", return_value=self.monitor_report()) as collector:
+            status, first = self.api("/api/status", method="GET", authenticated=False)
+            self.assertEqual(status, 200)
+            self.assertIn(first["status"], {"loading", "connected"})
+            self.await_monitor()
+            for _ in range(3):
+                status, report = self.api("/api/status", method="GET", authenticated=False)
+                self.assertEqual((status, report["status"], report["equity"]), (200, "connected", "100000"))
+                for private in (MONITOR_ACCOUNT, CONTROL_SECRET, BROKER_SECRET, str(self.control.state_dir)):
+                    self.assertNotIn(private, json.dumps(report))
+            collector.assert_called_once_with(self.client, MONITOR_ACCOUNT, "SBER")
+        self.assertIsNone(self.stored())
+        self.assertFalse(self.control.trading_path.exists())
+        self.assertEqual(len(report["events"]), 1)
+        self.assertFalse(self.client.calls)
+
+    def test_monitor_failure_preserves_previous_verified_timestamp_and_redacts_exception(self):
+        self.enable_monitor()
+        with patch("moex_bot.hosted.collect", return_value=self.monitor_report()):
+            self.control.public_status()
+            previous = self.await_monitor()
+        with self.control._monitor_lock:
+            self.control._monitor_checked = float("-inf")
+        with patch("moex_bot.hosted.collect", side_effect=ApiError(CONTROL_SECRET + BROKER_SECRET)):
+            self.control.public_status()
+            report = self.await_monitor()
+        self.assertEqual(report["status"], "error")
+        self.assertEqual(report["error"], "monitor_refresh_failed")
+        self.assertEqual(report["updated_at"], previous["updated_at"])
+        self.assertEqual(report["equity"], previous["equity"])
+        self.assertNotIn(BROKER_SECRET, json.dumps(report))
+        self.assertEqual(len(report["events"]), 2)
+
+    def test_monitor_does_not_overlap_sensitive_broker_operations(self):
+        self.enable_monitor()
+        self.control._requests.acquire()
+        try:
+            self.control.public_status()
+            report = self.await_monitor()
+        finally:
+            self.control._requests.release()
+        self.assertEqual(report["error"], "operation_in_progress")
+        self.factory.assert_not_called()
+
+    def test_existing_monitor_account_prevents_new_account_after_state_loss(self):
+        self.enable_monitor()
+        status, report = self.api("/api/connect")
+        self.assertEqual((status, report["error"]), (409, "configured_monitor_account_readonly"))
+        self.assertIsNone(self.stored())
+        self.factory.assert_not_called()
+
+    def test_monitor_account_configuration_requires_canonical_uuid(self):
+        for account in ("other-account", "../secret", 42, "ABCDEFAB-2222-4333-8444-555555555555"):
+            with self.subTest(account=account), self.assertRaises(ValueError):
+                replace(self.config, public_monitor_account_id=account)
 
     def test_unauthenticated_sensitive_operations_fail_before_network(self):
         for path in ("/api/check", "/api/connect", "/api/step"):
