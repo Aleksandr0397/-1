@@ -223,6 +223,7 @@ class HostedTests(unittest.TestCase):
         self.assertTrue(report["sandbox_authenticated"])
         self.assertFalse(report["connected"])
         self.assertFalse(report["market_data_authorized"])
+        self.assertEqual(report["failed_market_data_stage"], "resolve_share")
         self.assertEqual(report["broker_status_code"], 403)
         self.assertIsNone(report["broker_reason"])
         self.assertNotIn(BROKER_SECRET, json.dumps(report))

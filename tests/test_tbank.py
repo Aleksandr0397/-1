@@ -216,6 +216,16 @@ class CandleTests(unittest.TestCase):
 
 
 class ErrorTests(unittest.TestCase):
+    def test_only_numeric_broker_error_code_is_exposed(self):
+        for code, expected in [('40003', 40003), (SECRET, None), (True, None)]:
+            with self.subTest(code=code):
+                body = json.dumps({'code': code, 'message': SECRET}).encode()
+                error = urllib.error.HTTPError('https://example.test', 400, SECRET, {}, io.BytesIO(body))
+                with self.assertRaises(ApiError) as caught:
+                    TInvestClient(SECRET, transport=RecordingTransport(error)).list_sandbox_accounts()
+                self.assertEqual(caught.exception.broker_code, expected)
+                self.assertNotIn(SECRET, str(caught.exception))
+
     def test_direct_certificate_failure_is_safe_and_distinct(self):
         error = urllib.error.URLError(ssl.SSLCertVerificationError(1, SECRET))
         with self.assertRaises(ApiError) as caught:

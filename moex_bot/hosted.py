@@ -86,8 +86,10 @@ def _broker_diagnostics(error: Exception) -> dict:
         return {}
     status = error.status_code
     reason = error.reason
+    code = error.broker_code
     return {"broker_status_code": status if type(status) is int and 100 <= status <= 599 else None,
-            "broker_reason": reason if reason in {"proxy_tls_certificate", "broker_tls_certificate"} else None}
+            "broker_reason": reason if reason in {"proxy_tls_certificate", "broker_tls_certificate"} else None,
+            "broker_error_code": code if type(code) is int and 0 <= code <= 999_999_999 else None}
 
 
 def _private_database(path: Path) -> sqlite3.Connection:
@@ -278,20 +280,24 @@ class HostedControl:
         report = {"connected": True, "sandbox_authenticated": True,
                   "sandbox_account_count": len(accounts), "market_data_checked": market_data}
         if market_data:
+            stage = 'resolve_share'
             try:
                 instrument = client.resolve_share(self.config.ticker)
                 now = datetime.now(timezone.utc)
+                stage = 'get_daily_candles'
                 candles = client.get_daily_candles(instrument.uid, now - timedelta(days=180), now)
                 today = now.astimezone(MOEX_TZ).date()
                 completed = [candle for candle in candles if candle.time < now
                              and candle.time.astimezone(MOEX_TZ).date() < today]
+                stage = 'get_last_price'
                 price = client.get_last_price(instrument.uid)
                 report.update({"market_data_authorized": True, "ticker": instrument.ticker,
                                "lot": instrument.lot, "completed_candles": len(completed),
                                "last_price": str(price)})
             except Exception as error:
                 return 502, {**report, "connected": False, "market_data_authorized": False,
-                             "error": "market_data_check_failed", **_broker_diagnostics(error)}
+                             "error": "market_data_check_failed", "failed_market_data_stage": stage,
+                             **_broker_diagnostics(error)}
         return 200, report
 
     def _connect(self) -> tuple[int, dict]:

@@ -34,10 +34,12 @@ Transport = Callable[[urllib.request.Request, float], bytes]
 class ApiError(RuntimeError):
     """A safe error without response payloads, credentials, or remote messages."""
 
-    def __init__(self, message: str, *, status_code: int | None = None, reason: str | None = None) -> None:
+    def __init__(self, message: str, *, status_code: int | None = None, reason: str | None = None,
+                 broker_code: int | None = None) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.reason = reason
+        self.broker_code = broker_code
 
 
 def _integer(value: object) -> int:
@@ -189,15 +191,23 @@ class TInvestClient:
         try:
             payload = self._transport(request, self._timeout)
         except urllib.error.HTTPError as exc:
+            try:
+                error_body = exc.read(4096)
+            except (OSError, ValueError, AttributeError):
+                error_body = b''
             if exc.code == 503:
-                try:
-                    error_body = exc.read(4096)
-                except (OSError, ValueError, AttributeError):
-                    error_body = b''
                 if isinstance(error_body, bytes) and b'upstream connect error' in error_body and b'CERTIFICATE_VERIFY_FAILED' in error_body:
                     raise ApiError('Cloud proxy cannot verify the broker certificate; authentication was not reached',
                                    status_code=503, reason='proxy_tls_certificate') from None
-            raise ApiError(f"Broker HTTP error ({exc.code})", status_code=exc.code) from None
+            broker_code = None
+            try:
+                error_data = json.loads(error_body)
+                candidate = _integer(error_data.get('code'))
+                if 0 <= candidate <= 999_999_999:
+                    broker_code = candidate
+            except (ValueError, TypeError, AttributeError, UnicodeError):
+                pass
+            raise ApiError(f"Broker HTTP error ({exc.code})", status_code=exc.code, broker_code=broker_code) from None
         except urllib.error.URLError as exc:
             if isinstance(exc.reason, ssl.SSLCertVerificationError):
                 raise ApiError("Broker TLS certificate verification failed; authentication was not reached",
