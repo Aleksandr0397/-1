@@ -410,7 +410,7 @@ class HostedTests(unittest.TestCase):
         self.assertEqual(report["operations"][0]["payment"]["value"], "100000")
         for private in (MONITOR_ACCOUNT, CONTROL_SECRET, BROKER_SECRET):
             self.assertNotIn(private, json.dumps(report))
-        self.assertEqual(self.client.calls, [])
+        self.assertEqual(self.client.calls, [("portfolio", MONITOR_ACCOUNT)])
         self.assertIsNone(self.stored())
 
     def test_unauthenticated_sensitive_operations_fail_before_network(self):

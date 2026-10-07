@@ -569,7 +569,13 @@ class HostedControl:
                 raise ValueError("Invalid time")
         except (ValueError, TypeError):
             raise _ControlError(400, "invalid_restore_checkpoint") from None
-        rows = self._client_factory().get_sandbox_operations(account, created - timedelta(minutes=1), now)
+        client = self._client_factory()
+        rows = client.get_sandbox_operations(account, created - timedelta(minutes=1), now)
+        portfolio = client.get_sandbox_portfolio(account)
+        cash_positions = [position for position in portfolio.get("positions", [])
+                          if isinstance(position, dict) and position.get("instrumentType") == "currency"
+                          and position.get("figi") == "RUB000UTSTOM"]
+        cash_position = cash_positions[0] if len(cash_positions) == 1 else {}
         def amount(value):
             if not isinstance(value, dict):
                 return None
@@ -578,11 +584,20 @@ class HostedControl:
                 return {"value": str(money(value)), "currency": currency if currency in {"rub", "RUB"} else "other"}
             except Exception:
                 return None
+        def date(value):
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                return parsed.astimezone(timezone.utc).isoformat() if parsed.tzinfo is not None else None
+            except (ValueError, TypeError, AttributeError):
+                return None
+        def quantity(value):
+            return str(value) if isinstance(value, (str, int)) and re.fullmatch(r"[0-9]{1,19}", str(value)) else None
         result = []
         for row in rows[:50]:
             kind, state = row.get("operationType"), row.get("state")
             result.append({"operation_type": kind if isinstance(kind, str) and re.fullmatch(r"OPERATION_TYPE_[A-Z_]{1,64}", kind) else "unknown",
                            "state": state if isinstance(state, str) and re.fullmatch(r"OPERATION_STATE_[A-Z_]{1,64}", state) else "unknown",
+                           "date": date(row.get("date")),
                            "payment": amount(row.get("payment")), "price": amount(row.get("price")),
                            "quantity": row.get("quantity") if isinstance(row.get("quantity"), (str, int)) and re.fullmatch(r"[0-9]{1,19}", str(row.get("quantity"))) else None,
                            "quantity_rest": row.get("quantityRest") if isinstance(row.get("quantityRest"), (str, int)) and re.fullmatch(r"[0-9]{1,19}", str(row.get("quantityRest"))) else None,
@@ -591,7 +606,12 @@ class HostedControl:
                            "has_figi": bool(row.get("figi")), "has_instrument_uid": bool(row.get("instrumentUid")),
                            "has_parent": bool(row.get("parentOperationId")),
                            "has_position_uid": bool(row.get("positionUid")), "has_asset_uid": bool(row.get("assetUid")),
+                           "instrument_uid_matches_rub_cash": bool(row.get("instrumentUid")) and row.get("instrumentUid") == cash_position.get("instrumentUid"),
+                           "position_uid_matches_rub_cash": bool(row.get("positionUid")) and row.get("positionUid") == cash_position.get("positionUid"),
                            "trades_count": len(row.get("trades", [])) if isinstance(row.get("trades", []), list) else None,
+                           "trades": [{"quantity": quantity(trade.get("quantity")), "price": amount(trade.get("price")),
+                                       "date": date(trade.get("dateTime"))}
+                                      for trade in row.get("trades", [])[:5] if isinstance(trade, dict)] if isinstance(row.get("trades", []), list) else None,
                            "child_operations_count": len(row.get("childOperations", [])) if isinstance(row.get("childOperations", []), list) else None})
         return 200, {"sandbox_only": True, "operation_count": len(rows), "operations": result}
 
