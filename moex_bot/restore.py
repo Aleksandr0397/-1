@@ -70,7 +70,9 @@ def _rub(value: Any) -> Decimal:
     return money(value)
 
 
-def _cash_only(portfolio: Any, positions: Any, account_id: str, uid: str, initial_cash: Decimal) -> None:
+def _cash_only(portfolio: Any, positions: Any, account_id: str, uid: str,
+               initial_cash: Decimal) -> tuple[str, str] | None:
+    cash_identity = None
     try:
         if not isinstance(portfolio, dict) or not isinstance(positions, dict):
             raise ValueError("Invalid holdings")
@@ -105,15 +107,24 @@ def _cash_only(portfolio: Any, positions: Any, account_id: str, uid: str, initia
                     or _rub(position.get("currentPrice")) != 1
                     or money(position.get("blockedLots", {})) != 0):
                 raise ValueError("Unexpected portfolio position")
+            instrument_uid, position_uid = position.get("instrumentUid", ""), position.get("positionUid", "")
+            if any(not isinstance(value, str) or (value and not _identifier(value))
+                   for value in (instrument_uid, position_uid)):
+                raise ValueError("Invalid RUB position identity")
+            if instrument_uid == uid:
+                raise ValueError("RUB cash cannot identify the selected share")
+            if instrument_uid and position_uid:
+                cash_identity = (instrument_uid, position_uid)
         equity, cash, shares = _account_values(portfolio, positions, uid, 1)
     except Exception:
         raise RestoreError("unsupported_account_holdings") from None
     if equity != initial_cash or cash != initial_cash or shares != 0:
         raise RestoreError("cash_balance_mismatch")
+    return cash_identity
 
 
 def _history(operations: Any, initial_cash: Decimal, start: datetime, end: datetime,
-             prior_checkpoint_trusted: bool) -> None:
+             prior_checkpoint_trusted: bool, cash_identity: tuple[str, str] | None) -> None:
     if not isinstance(operations, list) or any(not isinstance(item, dict) for item in operations):
         raise RestoreError("history_not_proven")
     # The legacy endpoint provides no pagination/completeness flag and returns
@@ -151,11 +162,39 @@ def _history(operations: Any, initial_cash: Decimal, start: datetime, end: datet
             or operation.get("state") != "OPERATION_STATE_EXECUTED"
             or operation["currency"].lower() != "rub" or payment_value["currency"].lower() != "rub"
             or payment != initial_cash
-            or quantity != 0 or remaining != 0 or trades or child_operations or price != 0
+            or quantity != 0 or remaining != 0 or child_operations or price != 0
             or operation.get("instrumentType", "") not in ("", "currency")
-            or any(operation.get(key) for key in
-                   ("figi", "instrumentUid", "positionUid", "assetUid", "parentOperationId"))):
+            or operation.get("assetUid") or operation.get("parentOperationId")):
         raise RestoreError("history_contains_activity")
+    if not trades and not any(operation.get(key) for key in ("figi", "instrumentUid", "positionUid")):
+        return
+    # The observed SandboxPayIn uses RUB identifiers and one zero-quantity,
+    # zero-price ledger marker. Link BOTH identifiers to the independently
+    # validated current RUB position before interpreting it as cash funding.
+    if (cash_identity is None or operation.get("figi") != "RUB000UTSTOM"
+            or operation.get("instrumentUid") != cash_identity[0]
+            or operation.get("positionUid") != cash_identity[1] or len(trades) != 1):
+        raise RestoreError("history_contains_activity")
+    marker = trades[0]
+    try:
+        root_price_currency = operation.get("price", {}).get("currency", "")
+        if not isinstance(root_price_currency, str):
+            raise ValueError("Invalid cash funding price currency")
+        marker_quantity = _integer(marker.get("quantity", 0))
+        marker_price = marker.get("price")
+        marker_value = money(marker_price)
+        marker_currency = marker_price.get("currency", "")
+        if not isinstance(marker_currency, str):
+            raise ValueError("Invalid cash marker currency")
+        marker_date = _utc(marker.get("dateTime"))
+    except Exception:
+        raise RestoreError("history_not_proven") from None
+    if (root_price_currency.lower() not in ("", "rub")
+            or marker_quantity != 0 or marker_value != 0 or marker_currency.lower() not in ("", "rub")
+            or marker_date != date):
+        raise RestoreError("history_contains_activity")
+    if not prior_checkpoint_trusted:
+        raise RestoreError("history_not_proven")
 
 
 def restore_cash_account(client: Any, account_id: str, ticker: str, initial_cash: Decimal,
@@ -201,9 +240,9 @@ def restore_cash_account(client: Any, account_id: str, ticker: str, initial_cash
         raise RestoreError("active_sandbox_orders")
     portfolio = _read(client, "get_sandbox_portfolio", account_id)
     positions = _read(client, "get_sandbox_positions", account_id)
-    _cash_only(portfolio, positions, account_id, instrument.uid, initial_cash)
+    cash_identity = _cash_only(portfolio, positions, account_id, instrument.uid, initial_cash)
     operations = _read(client, "get_sandbox_operations", account_id, start, now)
-    _history(operations, initial_cash, start, now, prior_checkpoint_trusted)
+    _history(operations, initial_cash, start, now, prior_checkpoint_trusted, cash_identity)
     return {
         "version": 1,
         "identity": {"account_id": account_id, "uid": instrument.uid, "ticker": "SBER", "lot": 1,

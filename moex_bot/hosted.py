@@ -580,8 +580,9 @@ class HostedControl:
             if not isinstance(value, dict):
                 return None
             try:
-                currency = value.get("currency")
-                return {"value": str(money(value)), "currency": currency if currency in {"rub", "RUB"} else "other"}
+                currency = value.get("currency", "")
+                code = currency.lower() if isinstance(currency, str) and re.fullmatch(r"[A-Za-z]{0,3}", currency) else "other"
+                return {"value": str(money(value)), "currency": code}
             except Exception:
                 return None
         def date(value):

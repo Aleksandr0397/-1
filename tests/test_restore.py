@@ -28,6 +28,15 @@ def pay_in():
             "operationType": "OPERATION_TYPE_INPUT"}
 
 
+def cash_funding_marker():
+    zero_price = {"currency": "", **quotation(Decimal("0"))}
+    return {**pay_in(), "date": "2026-10-06T05:52:38.948409Z", "instrumentType": "",
+            "figi": "RUB000UTSTOM", "instrumentUid": "rub-cash-uid", "positionUid": "rub-position-uid",
+            "quantity": "0", "quantityRest": "0", "price": zero_price,
+            "trades": [{"tradeId": "initial-cash-marker", "quantity": "0", "price": zero_price,
+                        "dateTime": "2026-10-06T05:52:38.948409Z"}]}
+
+
 class CashClient:
     def __init__(self):
         self.instrument = Instrument("share-uid", "SBER", "TQBR", "Share", "rub", 1,
@@ -183,6 +192,78 @@ class RestorationTests(unittest.TestCase):
         self.assertEqual(self.restore()["high_water"], "100000")
         self.client.portfolio["positions"][0]["blockedLots"] = quotation(Decimal("1"))
         self.reject("unsupported_account_holdings")
+
+    def use_cash_funding_marker(self):
+        self.client.portfolio["positions"] = [{"instrumentType": "currency", "figi": "RUB000UTSTOM",
+                                               "instrumentUid": "rub-cash-uid", "positionUid": "rub-position-uid",
+                                               "quantity": quotation(Decimal("100000")), "currentPrice": rub("1")}]
+        self.client.operations = [cash_funding_marker()]
+
+    def test_observed_initial_cash_marker_is_accepted_with_independent_rub_identity(self):
+        self.use_cash_funding_marker()
+        self.assertEqual(self.restore(prior_checkpoint_trusted=True)["high_water"], "100000")
+        for currency in ("", "rub", "RUB"):
+            with self.subTest(root_price_currency=currency):
+                self.client.operations[0]["price"] = {"currency": currency}
+                self.assertEqual(self.restore(prior_checkpoint_trusted=True)["high_water"], "100000")
+        self.client.operations[0]["price"] = {}
+        self.assertEqual(self.restore(prior_checkpoint_trusted=True)["high_water"], "100000")
+        self.reject("history_not_proven")
+
+    def test_cash_marker_requires_both_matching_identifiers_and_rub_figi(self):
+        for update in ({"instrumentUid": "share-uid"}, {"positionUid": "another-position"},
+                       {"instrumentUid": ""}, {"positionUid": ""}, {"figi": "SBER-figi"},
+                       {"assetUid": "another-asset"}, {"parentOperationId": "another-operation"}):
+            with self.subTest(update=update):
+                self.use_cash_funding_marker()
+                self.client.operations[0].update(update)
+                self.reject("history_contains_activity", prior_checkpoint_trusted=True)
+        for update in ({"instrumentUid": ""}, {"positionUid": ""}):
+            with self.subTest(portfolio_update=update):
+                self.use_cash_funding_marker()
+                self.client.portfolio["positions"][0].update(update)
+                self.reject("history_contains_activity", prior_checkpoint_trusted=True)
+        self.use_cash_funding_marker()
+        self.client.portfolio["positions"] = []
+        self.reject("history_contains_activity", prior_checkpoint_trusted=True)
+        with self.subTest(rub_cash_uid_matches_selected_share=True):
+            self.use_cash_funding_marker()
+            self.client.portfolio["positions"][0]["instrumentUid"] = self.client.instrument.uid
+            self.client.operations[0]["instrumentUid"] = self.client.instrument.uid
+            self.reject("unsupported_account_holdings", prior_checkpoint_trusted=True)
+
+    def test_generic_deposit_cannot_use_the_cash_marker_exception_without_cash_linkage(self):
+        self.use_cash_funding_marker()
+        marker = self.client.operations[0]["trades"]
+        self.client.operations = [{**pay_in(), "trades": marker}]
+        self.reject("history_contains_activity", prior_checkpoint_trusted=True)
+
+    def test_cash_marker_nonzero_quantity_price_date_currency_and_multiple_trades_rejected(self):
+        for update in ({"quantity": "1"}, {"quantity": "-1"}, {"price": rub("0.000000001")},
+                       {"price": rub("-0.000000001")}, {"price": {"currency": "usd"}},
+                       {"dateTime": "2026-10-06T05:52:38.948410Z"}):
+            with self.subTest(update=update):
+                self.use_cash_funding_marker()
+                self.client.operations[0]["trades"][0].update(update)
+                self.reject("history_contains_activity", prior_checkpoint_trusted=True)
+        self.use_cash_funding_marker()
+        self.client.operations[0]["trades"] *= 2
+        self.reject("history_contains_activity", prior_checkpoint_trusted=True)
+        self.use_cash_funding_marker()
+        self.client.operations[0]["price"] = {"currency": "usd"}
+        self.reject("history_contains_activity", prior_checkpoint_trusted=True)
+
+    def test_cash_marker_malformed_fields_are_not_proof(self):
+        for update in ({"quantity": True}, {"quantity": 0.0}, {"price": {"units": True}},
+                       {"price": {"currency": False}}, {"dateTime": "bad"},
+                       {"dateTime": None}, {"dateTime": "2026-10-06T05:52:38.948409"}):
+            with self.subTest(update=update):
+                self.use_cash_funding_marker()
+                self.client.operations[0]["trades"][0].update(update)
+                self.reject("history_not_proven", prior_checkpoint_trusted=True)
+        self.use_cash_funding_marker()
+        self.client.operations[0]["price"] = {"currency": False}
+        self.reject("history_not_proven", prior_checkpoint_trusted=True)
 
     def test_missing_account_and_changed_instrument_are_rejected(self):
         self.client.accounts = ["different-account"]
