@@ -24,6 +24,8 @@ import xlrd
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Query, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from openpyxl import Workbook, load_workbook
@@ -37,6 +39,16 @@ import account_store
 load_dotenv(Path(__file__).with_name(".env"))
 logger = logging.getLogger(__name__)
 app = FastAPI(title="Окунев — заказы по прайсу", docs_url=None, redoc_url=None)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error(request: Request, error: RequestValidationError):
+    if request.url.path == "/api/accounts/password":
+        # The default validation details include entered values. Password fields
+        # must never be reflected in a response, even when validation fails.
+        return JSONResponse({"detail": "Укажите текущий пароль и новый пароль длиной от 8 до 128 символов."},
+                            status_code=422, headers={"Cache-Control": "no-store"})
+    return await request_validation_exception_handler(request, error)
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 MAX_ROWS = 20_000
@@ -534,6 +546,10 @@ def storage_call(function, *args):
         return function(*args)
     except account_store.DuplicateAccount:
         raise HTTPException(409, "Аккаунт с этим e-mail уже существует. Войдите с паролем.") from None
+    except account_store.InvalidSession:
+        raise HTTPException(401, "Сессия завершена. Войдите в аккаунт ещё раз.") from None
+    except account_store.IncorrectPassword:
+        raise HTTPException(400, "Текущий пароль указан неверно.") from None
     except Exception as error:
         logger.warning("Account storage unavailable (%s)", type(error).__name__)
         raise HTTPException(503, "Постоянная история заказов временно недоступна. Попробуйте позже.") from None
@@ -675,6 +691,12 @@ class AccountProfile(BaseModel):
     delivery_address: str = Field(max_length=500)
 
 
+class AccountPasswordChange(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=8, max_length=128)
+
+
 def session_secure(request):
     setting = os.environ.get("SESSION_COOKIE_SECURE", "").strip().lower()
     return setting in {"1", "true", "yes"} if setting else request.url.scheme == "https"
@@ -739,6 +761,16 @@ def logout_account(request: Request):
     response.delete_cookie("okunev_session", path="/", httponly=True,
                            secure=session_secure(request), samesite="lax")
     return response
+
+
+@app.post("/api/accounts/password")
+def update_account_password(details: AccountPasswordChange, request: Request, x_account_id: str | None = Header(default=None)):
+    user = require_account(request)
+    if x_account_id is not None and x_account_id != user["id"]:
+        raise HTTPException(409, "Аккаунт изменился. Обновите страницу и войдите в нужный аккаунт.")
+    changed_user, token = storage_call(account_store.change_password, user["id"], request.cookies.get("okunev_session"),
+                                      details.current_password, details.new_password)
+    return account_response(request, changed_user, token)
 
 
 @app.get("/api/orders/history")

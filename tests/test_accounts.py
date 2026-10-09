@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,6 +17,7 @@ from fastapi.testclient import TestClient
 from openpyxl import Workbook, load_workbook
 
 from app import app
+import account_store
 from account_store import postgres_tls_options
 
 
@@ -247,6 +249,11 @@ with TestClient(app) as client:
             self.assertEqual(response.status_code, 200, response.text)
             self.assertIn("Secure", response.headers["set-cookie"])
             self.assertTrue(client.get("/api/accounts/me").json()["user"])
+            rotated = client.post("/api/accounts/password", json={"current_password": PASSWORD,
+                                                                   "new_password": "new-secure-password-0123"})
+            self.assertEqual(rotated.status_code, 200, rotated.text)
+            self.assertIn("Secure", rotated.headers["set-cookie"])
+            self.assertTrue(client.get("/api/accounts/me").json()["user"])
 
     def test_wrong_password_unknown_account_and_duplicate_registration(self):
         self.register()
@@ -262,6 +269,176 @@ with TestClient(app) as client:
         for credentials in ({"email": "invalid", "password": PASSWORD},
                             {"email": "valid@example.com", "password": "short"}):
             self.assertEqual(self.other.post("/api/accounts/register", json=credentials).status_code, 422)
+
+    def test_password_change_requires_live_account_and_configured_storage(self):
+        body = {"current_password": PASSWORD, "new_password": "new-test-password-0123"}
+        self.assertEqual(self.client.post("/api/accounts/password", json=body).status_code, 401)
+        with patch.dict(os.environ, {"ORDERS_HISTORY_DIR": ""}):
+            self.assertEqual(self.client.post("/api/accounts/password", json=body).status_code, 503)
+        self.register()
+        self.client.post("/api/accounts/logout")
+        self.assertEqual(self.client.post("/api/accounts/password", json=body).status_code, 401)
+
+    def account_secrets(self):
+        with sqlite3.connect(Path(self.history_dir) / "accounts.sqlite3") as connection:
+            return (connection.execute("SELECT id, password_hash FROM users ORDER BY id").fetchall(),
+                    connection.execute("SELECT token_hash, user_id, expires_at FROM sessions ORDER BY token_hash").fetchall())
+
+    def test_wrong_current_password_does_not_change_password_or_revoke_sessions(self):
+        user = self.register()
+        self.assertEqual(self.other.post("/api/accounts/login", json={"email": user["email"], "password": PASSWORD}).status_code, 200)
+        before = self.account_secrets()
+        token = self.client.cookies.get("okunev_session")
+        body = {"current_password": "wrong-current-secret", "new_password": "unused-new-secret-0123"}
+        response = self.client.post("/api/accounts/password", json=body)
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual(response.json(), {"detail": "Текущий пароль указан неверно."})
+        for password in body.values():
+            self.assertNotIn(password, response.text)
+        self.assertEqual(self.account_secrets(), before)
+        self.assertEqual(self.client.cookies.get("okunev_session"), token)
+        self.assertEqual(self.client.get("/api/accounts/me").json()["user"], user)
+        self.assertEqual(self.other.get("/api/accounts/me").json()["user"], user)
+
+    def test_password_change_rotates_cookie_revokes_old_devices_and_preserves_private_data(self):
+        user_a = self.register()
+        self.client.put("/api/accounts/profile", json=self.profile(name="Имя А", company="Компания А"))
+        profile = self.client.get("/api/accounts/profile").json()
+        exported = self.exported()
+        history = self.client.get("/api/orders/history").json()
+        self.assertEqual(self.other.post("/api/accounts/login", json={"email": user_a["email"], "password": PASSWORD}).status_code, 200)
+        old_token = self.client.cookies.get("okunev_session")
+        old_device_token = self.other.cookies.get("okunev_session")
+        before_hash = self.account_secrets()[0][0][1]
+        new_password = "new-test-password-0123"
+        with TestClient(app) as buyer_b:
+            user_b = self.register(buyer_b, "buyer-b@example.com")
+            b_token = buyer_b.cookies.get("okunev_session")
+            response = self.client.post("/api/accounts/password", headers={"X-Account-Id": user_a["id"]},
+                                        json={"current_password": PASSWORD, "new_password": new_password})
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json(), {"available": True, "user": user_a})
+            self.assertEqual(response.headers["cache-control"], "no-store")
+            self.assertIn("HttpOnly", response.headers["set-cookie"])
+            self.assertIn("SameSite=lax", response.headers["set-cookie"])
+            new_token = self.client.cookies.get("okunev_session")
+            self.assertNotIn(new_token, (old_token, old_device_token))
+            self.assertEqual(self.client.get("/api/accounts/me").json()["user"], user_a)
+            self.assertIsNone(self.other.get("/api/accounts/me").json()["user"])
+            self.assertEqual(self.other.get("/api/accounts/profile").status_code, 401)
+            with TestClient(app) as replay:
+                replay.cookies.set("okunev_session", old_token)
+                self.assertEqual(replay.get("/api/accounts/profile").status_code, 401)
+            self.assertEqual(self.other.post("/api/accounts/login", json={"email": user_a["email"], "password": PASSWORD}).status_code, 401)
+            self.assertEqual(self.other.post("/api/accounts/login", json={"email": user_a["email"], "password": new_password}).status_code, 200)
+            self.assertEqual(buyer_b.cookies.get("okunev_session"), b_token)
+            self.assertEqual(buyer_b.get("/api/accounts/me").json()["user"], user_b)
+            self.assertEqual(buyer_b.post("/api/accounts/login", json={"email": user_b["email"], "password": PASSWORD}).status_code, 200)
+        self.assertEqual(self.client.get("/api/accounts/profile").json(), profile)
+        self.assertEqual(self.client.get("/api/orders/history").json(), history)
+        self.assertEqual(self.client.get(f"/api/orders/history/{exported.headers['x-order-id']}/file").content, exported.content)
+        with sqlite3.connect(Path(self.history_dir) / "accounts.sqlite3") as connection:
+            stored_hash = connection.execute("SELECT password_hash FROM users WHERE id = ?", (user_a["id"],)).fetchone()[0]
+            tokens = {row[0] for row in connection.execute("SELECT token_hash FROM sessions WHERE user_id = ?", (user_a["id"],))}
+        self.assertNotEqual(stored_hash, before_hash)
+        self.assertTrue(stored_hash.startswith("pbkdf2_sha256$600000$"))
+        for password in (PASSWORD, new_password):
+            self.assertNotIn(password, stored_hash)
+            self.assertNotIn(password, response.text)
+        self.assertNotIn(hashlib.sha256(old_token.encode()).hexdigest(), tokens)
+        self.assertNotIn(hashlib.sha256(old_device_token.encode()).hexdigest(), tokens)
+        self.assertIn(hashlib.sha256(new_token.encode()).hexdigest(), tokens)
+
+    def test_stale_account_header_cannot_change_another_accounts_password(self):
+        user_a = self.register()
+        self.register(self.other, "buyer-b@example.com")
+        before = self.account_secrets()
+        response = self.other.post("/api/accounts/password", headers={"X-Account-Id": user_a["id"]},
+                                   json={"current_password": PASSWORD, "new_password": "new-test-password-0123"})
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(self.account_secrets(), before)
+
+    def test_password_change_validation_rejects_invalid_fields_without_echoing_secrets(self):
+        self.register()
+        before = self.account_secrets()
+        valid = {"current_password": PASSWORD, "new_password": "new-test-password-0123"}
+        invalid = [{}, {"current_password": PASSWORD}, {"new_password": valid["new_password"]},
+                   {**valid, "email": "injected@example.com"}, {**valid, "user_id": "other-user"},
+                   {**valid, "current_password": ""}, {**valid, "current_password": "c" * 129},
+                   {**valid, "new_password": "short"}, {**valid, "new_password": "n" * 129}]
+        for field in valid:
+            invalid.extend({**valid, field: value} for value in (None, 42, True, []))
+        for body in invalid:
+            with self.subTest(body=body):
+                response = self.client.post("/api/accounts/password", json=body)
+                self.assertEqual(response.status_code, 422, response.text)
+                for password in (body.get("current_password"), body.get("new_password")):
+                    if isinstance(password, str) and password:
+                        self.assertNotIn(password, response.text)
+        self.assertEqual(self.account_secrets(), before)
+
+    def test_password_change_preserves_whitespace_and_accepts_password_length_boundaries(self):
+        user = self.register()
+        current = PASSWORD
+        for new_password in (" 123456 ", "n" * 128):
+            response = self.client.post("/api/accounts/password", json={"current_password": current, "new_password": new_password})
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(self.other.post("/api/accounts/login", json={"email": user["email"], "password": new_password}).status_code, 200)
+            if new_password.strip() != new_password:
+                self.assertEqual(self.other.post("/api/accounts/login", json={"email": user["email"], "password": new_password.strip()}).status_code, 422)
+            current = new_password
+
+    def test_password_change_rechecks_revocation_or_expiry_inside_transaction(self):
+        user = self.register()
+        original_change = account_store.change_password
+        for condition in ("revoked", "expired"):
+            with self.subTest(condition=condition):
+                self.assertEqual(self.client.post("/api/accounts/login", json={"email": user["email"], "password": PASSWORD}).status_code, 200)
+                def invalidate_before_transaction(*args):
+                    token = args[1]
+                    if condition == "revoked":
+                        account_store.logout(token)
+                    else:
+                        with sqlite3.connect(Path(self.history_dir) / "accounts.sqlite3") as connection:
+                            connection.execute("UPDATE sessions SET expires_at = ? WHERE token_hash = ?",
+                                               (int(time.time()) - 1, hashlib.sha256(token.encode()).hexdigest()))
+                    return original_change(*args)
+                with patch("account_store.change_password", side_effect=invalidate_before_transaction):
+                    response = self.client.post("/api/accounts/password", json={"current_password": PASSWORD, "new_password": "new-test-password-0123"})
+                self.assertEqual(response.status_code, 401, response.text)
+                self.assertNotIn("set-cookie", response.headers)
+                self.assertEqual(self.other.post("/api/accounts/login", json={"email": user["email"], "password": PASSWORD}).status_code, 200)
+
+    def test_concurrent_password_changes_allow_only_one_rotation_from_same_old_cookie(self):
+        user = self.register()
+        token = self.client.cookies.get("okunev_session")
+        def change(new_password):
+            with TestClient(app) as client:
+                client.cookies.set("okunev_session", token, domain="testserver.local", path="/")
+                response = client.post("/api/accounts/password", json={"current_password": PASSWORD, "new_password": new_password})
+                return response.status_code, new_password, client.cookies.get("okunev_session")
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            results = list(workers.map(change, ("first-new-password-0123", "second-new-password-0123")))
+        self.assertEqual(sorted(result[0] for result in results), [200, 401])
+        winner = next(result for result in results if result[0] == 200)
+        loser = next(result for result in results if result[0] != 200)
+        self.assertNotEqual(winner[2], token)
+        self.assertIsNone(self.client.get("/api/accounts/me").json()["user"])
+        self.assertEqual(self.other.post("/api/accounts/login", json={"email": user["email"], "password": loser[1]}).status_code, 401)
+        self.assertEqual(self.other.post("/api/accounts/login", json={"email": user["email"], "password": winner[1]}).status_code, 200)
+
+    def test_password_change_rolls_back_password_and_revocation_if_new_session_write_fails(self):
+        user = self.register()
+        self.assertEqual(self.other.post("/api/accounts/login", json={"email": user["email"], "password": PASSWORD}).status_code, 200)
+        before = self.account_secrets()
+        with patch("account_store.new_session", side_effect=OSError("private storage failure")):
+            response = self.client.post("/api/accounts/password", json={"current_password": PASSWORD, "new_password": "new-test-password-0123"})
+        self.assertEqual(response.status_code, 503, response.text)
+        self.assertNotIn("private storage failure", response.text)
+        self.assertNotIn("set-cookie", response.headers)
+        self.assertEqual(self.account_secrets(), before)
+        self.assertEqual(self.client.get("/api/accounts/me").json()["user"], user)
+        self.assertEqual(self.other.get("/api/accounts/me").json()["user"], user)
 
     def test_accounts_cannot_list_or_download_each_others_orders(self):
         user_a = self.register()

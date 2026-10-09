@@ -2,6 +2,7 @@
 
 const el = (id) => document.getElementById(id);
 const profileFields = { name: 'profile-name', phone: 'profile-phone', company: 'profile-company', delivery_address: 'profile-delivery-address' };
+const passwordFields = ['current-password', 'new-password', 'confirm-password'];
 let mode = 'login';
 let currentUser = null;
 let busy = false;
@@ -26,8 +27,14 @@ async function jsonApi(url, options = {}) {
 }
 function setBusy(value) {
   busy = value;
-  for (const id of ['account-submit', 'auth-login', 'auth-register', 'account-logout', 'profile-save', 'account-retry']) el(id).disabled = value;
-  for (const id of Object.values(profileFields)) el(id).disabled = value;
+  for (const id of ['account-submit', 'auth-login', 'auth-register', 'account-logout', 'profile-save', 'account-retry', 'open-password', 'password-close', 'password-cancel', 'password-save', 'password-toggle']) el(id).disabled = value;
+  for (const id of [...Object.values(profileFields), ...passwordFields]) el(id).disabled = value;
+}
+function resetPasswordForm() {
+  for (const id of passwordFields) { el(id).value = ''; el(id).type = 'password'; }
+  el('password-toggle').textContent = 'Показать';
+  el('password-toggle').setAttribute('aria-pressed', 'false');
+  message('password-feedback', '');
 }
 function prepareGuestCart(user) {
   try {
@@ -41,6 +48,9 @@ function prepareGuestCart(user) {
   } catch (_) { /* Login works even when browser storage is unavailable. */ }
 }
 function accountView(user) {
+  el('password-dialog').close();
+  resetPasswordForm();
+  message('password-result', '');
   currentUser = user;
   el('account-link').textContent = user ? 'Мой аккаунт' : 'Войти';
   el('profile-heading').textContent = user ? 'Мой аккаунт' : 'Вход в аккаунт';
@@ -136,6 +146,45 @@ el('profile-form').addEventListener('submit', async (event) => {
   } finally { setBusy(false); }
 });
 el('profile-form').addEventListener('input', () => message('profile-feedback', ''));
+el('open-password').addEventListener('click', () => {
+  if (busy || !currentUser) return;
+  resetPasswordForm(); message('password-result', '');
+  el('password-dialog').showModal(); el('current-password').focus();
+});
+for (const id of ['password-close', 'password-cancel']) el(id).addEventListener('click', () => {
+  if (!busy) { resetPasswordForm(); el('password-dialog').close(); }
+});
+el('password-dialog').addEventListener('cancel', (event) => {
+  if (busy) event.preventDefault();
+  else resetPasswordForm();
+});
+el('password-dialog').addEventListener('close', () => { if (!el('password-dialog').open) resetPasswordForm(); });
+el('password-toggle').addEventListener('click', () => {
+  if (busy) return;
+  const show = el('new-password').type === 'password';
+  for (const id of ['new-password', 'confirm-password']) el(id).type = show ? 'text' : 'password';
+  el('password-toggle').textContent = show ? 'Скрыть' : 'Показать';
+  el('password-toggle').setAttribute('aria-pressed', String(show));
+});
+el('password-form').addEventListener('input', () => message('password-feedback', ''));
+el('password-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  if (busy || !currentUser) return;
+  if (el('new-password').value !== el('confirm-password').value) {
+    message('password-feedback', 'Новые пароли не совпадают.', true); el('confirm-password').focus(); return;
+  }
+  const details = { current_password: el('current-password').value, new_password: el('new-password').value };
+  setBusy(true); message('password-feedback', 'Сохраняем пароль…');
+  try {
+    const result = await jsonApi('/api/accounts/password', { method: 'POST', headers: { 'X-Account-Id': currentUser.id }, body: JSON.stringify(details) });
+    currentUser = result.user;
+    el('password-dialog').close(); resetPasswordForm();
+    message('password-result', 'Пароль изменён. Для следующего входа используйте новый пароль.');
+  } catch (error) {
+    if (error.status === 401 || error.status === 409) accountError(error);
+    else message('password-feedback', error.message || 'Не удалось сохранить пароль. Попробуйте ещё раз.', true);
+  } finally { setBusy(false); }
+});
 el('account-logout').addEventListener('click', async () => {
   if (busy) return;
   setBusy(true);

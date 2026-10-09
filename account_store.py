@@ -26,6 +26,14 @@ class DuplicateAccount(ValueError):
     pass
 
 
+class InvalidSession(ValueError):
+    pass
+
+
+class IncorrectPassword(ValueError):
+    pass
+
+
 def postgres_configured():
     return bool(os.environ.get("ORDERS_DATABASE_URL", "").strip())
 
@@ -205,15 +213,41 @@ def register(email, password):
 
 def login(email, password):
     with database() as connection:
+        # Password verification and session creation must serialize with changes
+        # so a login using an old hash cannot issue a session after revocation.
+        connection.execute("BEGIN IMMEDIATE")
         user = connection.execute("SELECT id, email, password_hash FROM users WHERE email = ?", (email,)).fetchone()
         if user is None:
             # Match the normal password hashing cost even for an unknown email.
             hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), b"unknown-account!", PASSWORD_ITERATIONS)
+            connection.rollback()
             return None
         if not password_matches(password, user["password_hash"]):
+            connection.rollback()
             return None
-        connection.execute("BEGIN IMMEDIATE")
         token = new_session(connection, user["id"])
+        connection.commit()
+        return {"id": user["id"], "email": user["email"]}, token
+
+
+def change_password(user_id, session_token, current_password, new_password):
+    if not session_token or len(session_token) > 256:
+        raise InvalidSession("Session is no longer valid")
+    with database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        user = connection.execute("""
+            SELECT users.id, users.email, users.password_hash FROM sessions JOIN users ON users.id = sessions.user_id
+            WHERE sessions.token_hash = ? AND sessions.user_id = ? AND sessions.expires_at > ?
+        """, (token_hash(session_token), user_id, int(time.time()))).fetchone()
+        if user is None:
+            connection.rollback()
+            raise InvalidSession("Session is no longer valid")
+        if not password_matches(current_password, user["password_hash"]):
+            connection.rollback()
+            raise IncorrectPassword("Current password is incorrect")
+        connection.execute("UPDATE users SET password_hash = ? WHERE id = ?", (password_hash(new_password), user_id))
+        connection.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+        token = new_session(connection, user_id)
         connection.commit()
         return {"id": user["id"], "email": user["email"]}, token
 
@@ -233,6 +267,8 @@ def logout(token):
     if not token or len(token) > 256:
         return
     with database() as connection:
+        # Coordinate revocation with login and password changes on both stores.
+        connection.execute("BEGIN IMMEDIATE")
         connection.execute("DELETE FROM sessions WHERE token_hash = ?", (token_hash(token),))
         connection.commit()
 

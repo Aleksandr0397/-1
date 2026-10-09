@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#153db9">
   <title>Мой аккаунт — Окунев</title>
-  <link rel="stylesheet" href="/styles.css">
-  <script src="/account.js" defer></script>
+  <link rel="stylesheet" href="/styles.css?v=20261009-password">
+  <script src="/account.js?v=20261009-password" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#profile-heading">Перейти к личным данным</a>
@@ -43,7 +43,7 @@
           <div class="profile-fields">
             <div class="profile-field"><label for="profile-name">Имя</label><input id="profile-name" maxlength="100" autocomplete="name" placeholder="Как к вам обращаться"></div>
             <div class="profile-field"><label for="profile-phone">Телефон</label><input id="profile-phone" type="tel" maxlength="40" autocomplete="tel" placeholder="+7 …"></div>
-            <div class="profile-field profile-field-wide"><label for="profile-email">Электронная почта</label><input id="profile-email" type="email" readonly aria-describedby="profile-email-hint"><p class="format-hint" id="profile-email-hint">Почта, с которой вы входите в аккаунт.</p></div>
+            <div class="profile-field profile-field-wide"><label for="profile-email">Электронная почта</label><div class="profile-email-controls"><input id="profile-email" type="email" readonly aria-describedby="profile-email-hint"><button class="button button-outline" id="open-password" type="button" aria-haspopup="dialog" aria-controls="password-dialog">Сменить пароль</button></div><p class="format-hint" id="profile-email-hint">Почта, с которой вы входите в аккаунт.</p><div class="feedback" id="password-result" role="status" aria-live="polite" hidden></div></div>
             <div class="profile-field profile-field-wide"><label for="profile-company">Название компании</label><input id="profile-company" maxlength="200" autocomplete="organization" placeholder="Компания или ИП"></div>
             <div class="profile-field profile-field-wide"><label for="profile-delivery-address">Адрес доставки</label><textarea id="profile-delivery-address" maxlength="500" rows="3" autocomplete="street-address" placeholder="Город, улица, дом и другие сведения для доставки"></textarea></div>
           </div>
@@ -54,5 +54,16 @@
     </section>
   </main>
   <footer class="site-footer"><span>Окунев</span><span>Поиск. Выбор. Заказ.</span></footer>
+  <dialog class="upload-dialog" id="password-dialog" aria-labelledby="password-heading" aria-describedby="password-description">
+    <div class="dialog-heading"><h2 id="password-heading">Сменить пароль</h2><button class="icon-button" id="password-close" type="button" aria-label="Отменить смену пароля и закрыть окно">×</button></div>
+    <p class="dialog-description" id="password-description">Введите текущий пароль и придумайте новый — от 8 символов.</p>
+    <form id="password-form">
+      <label class="field-label" for="current-password">Текущий пароль</label><input id="current-password" type="password" minlength="1" maxlength="128" autocomplete="current-password" required>
+      <label class="field-label" for="new-password">Новый пароль</label><div class="password-input-row"><input id="new-password" type="password" minlength="8" maxlength="128" autocomplete="new-password" required><button class="button button-outline" id="password-toggle" type="button" aria-controls="new-password confirm-password" aria-pressed="false">Показать</button></div>
+      <label class="field-label" for="confirm-password">Повторите новый пароль</label><input id="confirm-password" type="password" minlength="8" maxlength="128" autocomplete="new-password" required>
+      <div class="feedback" id="password-feedback" role="status" aria-live="polite" hidden></div>
+      <div class="dialog-actions"><button class="button button-outline" id="password-cancel" type="button">Отменить</button><button class="button button-primary" id="password-save" type="submit">Сохранить пароль</button></div>
+    </form>
+  </dialog>
 </body>
 </html>
