@@ -654,12 +654,41 @@ with TestClient(app) as client:
             connection.send_message.return_value = {}
             response = self.client.post("/api/orders/send", json=self.order())
             self.assertEqual(response.status_code, 200, response.text)
-            self.assertEqual(set(response.json()), {"ok", "order_id"})
+            self.assertEqual(set(response.json()), {"ok", "order_id", "order_saved"})
+            self.assertIs(response.json()["order_saved"], True)
             attached = list(connection.send_message.call_args.args[0].iter_attachments())[0].get_payload(decode=True)
         order_id = response.json()["order_id"]
         history = self.client.get("/api/orders/history").json()["orders"]
+        self.assertEqual([order["id"] for order in history], [order_id])
         self.assertEqual(history[0]["status"], "sent")
         self.assertEqual(self.client.get(f"/api/orders/history/{order_id}/file").content, attached)
+
+    def test_anonymous_smtp_success_reports_order_not_saved_when_history_disabled(self):
+        settings = {"ORDERS_HISTORY_DIR": "", "SMTP_HOST": "smtp.example.com",
+                    "SMTP_FROM": "sender@example.com", "ORDERS_TO": "owner@example.com"}
+        with patch.dict(os.environ, settings), patch("app.smtplib.SMTP", autospec=True) as smtp:
+            connection = smtp.return_value.__enter__.return_value
+            connection.send_message.return_value = {}
+            response = self.client.post("/api/orders/send", json=self.order())
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(set(response.json()), {"ok", "order_id", "order_saved"})
+            self.assertIs(response.json()["ok"], True)
+            self.assertIs(response.json()["order_saved"], False)
+            self.assertTrue(response.json()["order_id"])
+            attached = list(connection.send_message.call_args.args[0].iter_attachments())[0].get_payload(decode=True)
+            self.assertEqual(load_workbook(io.BytesIO(attached))["Заказ"]["B3"].value, 2)
+            self.assertEqual(self.client.get("/api/orders/history").status_code, 503)
+
+    def test_smtp_is_not_attempted_when_initial_order_persistence_fails(self):
+        self.register()
+        settings = {"SMTP_HOST": "smtp.example.com", "SMTP_FROM": "sender@example.com", "ORDERS_TO": "owner@example.com"}
+        with patch.dict(os.environ, settings), patch("account_store.save_order", side_effect=OSError("storage unavailable")), \
+                patch("app.smtplib.SMTP", autospec=True) as smtp:
+            response = self.client.post("/api/orders/send", json=self.order())
+            self.assertEqual(response.status_code, 503, response.text)
+            self.assertNotIn("order_saved", response.json())
+            smtp.assert_not_called()
+        self.assertEqual(self.client.get("/api/orders/history").json()["orders"], [])
 
     def test_failed_smtp_history_keeps_downloadable_order_and_failed_status(self):
         self.register()

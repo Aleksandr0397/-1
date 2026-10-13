@@ -666,7 +666,7 @@ def send_order(order: OrderRequest, request: Request):
         raise HTTPException(502, "Не удалось отправить письмо. Заказ сохранён в корзине. Попробуйте позже или скачайте Excel.") from error
     if user:
         storage_call(account_store.update_order_status, user["id"], order_id, "sent")
-    return {"ok": True, "order_id": order_id}
+    return {"ok": True, "order_id": order_id, "order_saved": bool(user)}
 
 
 class AccountCredentials(BaseModel):

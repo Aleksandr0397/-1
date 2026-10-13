@@ -147,6 +147,7 @@ function validQuantity(value) { const number = Number(value); return Number.isIn
 function quantityInput(product, value, className) {
   const input = node('input', className);
   input.type = 'number'; input.min = '1'; input.max = '999999'; input.step = '1'; input.value = String(value);
+  input.disabled = state.busy;
   input.dataset.productId = product.id;
   input.inputMode = 'numeric'; input.setAttribute('aria-label', 'Количество: ' + product.name);
   input.addEventListener('keydown', (event) => { if (['.', ',', 'e', 'E', '-', '+'].includes(event.key)) event.preventDefault(); });
@@ -163,6 +164,7 @@ function quantityStepper(input) {
     button.setAttribute('aria-label', label + ': ' + input.getAttribute('aria-label').replace(/^Количество: /, ''));
     button.addEventListener('mousedown', (event) => event.preventDefault());
     button.addEventListener('click', () => {
+      if (state.busy) return;
       if (!validQuantity(input.value)) {
         input.setCustomValidity('Введите целое количество от 1 до 999 999.'); input.reportValidity(); return;
       }
@@ -174,7 +176,7 @@ function quantityStepper(input) {
       current?.closest('.quantity-stepper')?.querySelector(direction === 1 ? '.quantity-increase' : '.quantity-decrease')?.focus({ preventScroll: true });
     });
   }
-  function updateLimits() { up.disabled = Number(input.value) >= 999999; down.disabled = Number(input.value) <= 1; }
+  function updateLimits() { up.disabled = state.busy || Number(input.value) >= 999999; down.disabled = state.busy || Number(input.value) <= 1; }
   input.addEventListener('input', updateLimits); input.addEventListener('change', updateLimits);
   updateLimits(); arrows.append(up, down); wrapper.append(input, arrows);
   return wrapper;
@@ -241,9 +243,10 @@ function renderProducts() {
     quantityCell.append(quantityStepper(input));
     const action = node('td');
     const button = node('button', 'button product-add', 'В заказ');
-    button.disabled = !storageKey;
+    button.disabled = state.busy || !storageKey;
     button.type = 'button'; button.setAttribute('aria-label', 'Добавить в заказ: ' + product.name);
     function add() {
+      if (state.busy) return;
       if (!storageKey) { notify('Обновите страницу, чтобы восстановить свой аккаунт и корзину.'); return; }
       const quantity = Number(input.value);
       if (!validQuantity(quantity)) { input.setCustomValidity('Введите целое количество от 1 до 999 999.'); input.reportValidity(); return; }
@@ -311,12 +314,14 @@ function renderCart() {
     const top = node('div', 'cart-top');
     const remove = node('button', 'icon-button', '×');
     remove.type = 'button'; remove.setAttribute('aria-label', 'Убрать из заказа: ' + product.name);
-    remove.addEventListener('click', () => { state.cart.delete(id); state.cartProducts.delete(id); basketChanged(); renderCart(); });
+    remove.disabled = state.busy;
+    remove.addEventListener('click', () => { if (state.busy) return; state.cart.delete(id); state.cartProducts.delete(id); basketChanged(); renderCart(); });
     top.append(node('span', 'cart-name', product.name), remove);
     const controls = node('div', 'cart-controls');
     const wrap = node('div', 'cart-quantity-wrap');
     const input = quantityInput(product, quantity, 'cart-quantity');
     input.addEventListener('change', () => {
+      if (state.busy) { input.value = String(state.cart.get(id)); return; }
       if (!validQuantity(input.value)) { input.value = String(state.cart.get(id)); notify('Укажите целое количество от 1 до 999 999.'); return; }
       state.cart.set(id, Number(input.value)); basketChanged(); renderCart();
     });
@@ -358,17 +363,65 @@ function updateActions() {
   byId('download-order').disabled = state.busy || !available || needsLogin || !storageKey;
   byId('send-order').disabled = state.busy || !available || needsLogin || !storageKey || !state.config?.mail_ready || Boolean(sent);
   byId('send-order').textContent = state.busy ? 'Подождите…' : sent ? 'Заказ отправлен' : 'Отправить заказ';
+  byId('clear-cart').disabled = state.busy;
+  for (const id of ['open-upload', 'empty-upload']) byId(id).disabled = state.busy;
+  for (const input of document.querySelectorAll('.quantity-stepper input')) {
+    input.disabled = state.busy;
+    const wrapper = input.closest('.quantity-stepper');
+    wrapper.querySelector('.quantity-increase').disabled = state.busy || Number(input.value) >= 999999;
+    wrapper.querySelector('.quantity-decrease').disabled = state.busy || Number(input.value) <= 1;
+  }
+  for (const button of document.querySelectorAll('.product-add')) button.disabled = state.busy || !storageKey;
+  for (const button of document.querySelectorAll('.cart-top .icon-button')) button.disabled = state.busy;
+  for (const input of byId('customer-form').querySelectorAll('input, textarea')) input.disabled = state.busy;
+}
+function removeCompletedItems(payload, submittedProducts, submittedStorageKey) {
+  if (storageKey !== submittedStorageKey) return;
+  for (const item of payload.items) {
+    let id = item.product_id;
+    if (!state.cart.has(id)) {
+      const original = submittedProducts.get(id);
+      if (!original) continue;
+      const candidates = Array.from(state.cart.keys()).filter(candidateId => {
+        const product = state.cartProducts.get(candidateId) || state.products.get(candidateId);
+        if (!product || productIdentity(product.unit) !== productIdentity(original.unit)) return false;
+        if (original.sku && product.sku) return productIdentity(original.sku) === productIdentity(product.sku);
+        return productIdentity(product.name) === productIdentity(original.name);
+      });
+      if (candidates.length !== 1) continue;
+      id = candidates[0];
+    }
+    const remaining = (state.cart.get(id) || 0) - Number(item.quantity);
+    if (remaining > 0) state.cart.set(id, remaining);
+    else { state.cart.delete(id); state.cartProducts.delete(id); }
+  }
+  saveCart(); renderCart();
+}
+function completedOrderFeedback(send, orderId, saved) {
+  if (!saved) {
+    feedback('order-feedback', (send ? 'Заказ отправлен.' : 'Excel подготовлен для скачивания.') + ' Сохранение в «Моих заказах» не подтверждено. Корзина сохранена.', true);
+    return;
+  }
+  feedback('order-feedback', (send ? 'Заказ отправлен и сохранён в «Моих заказах».' : 'Excel готов. Заказ сохранён в «Моих заказах».') + ' Заказанные товары убраны из корзины; отсутствующие позиции остаются.');
+  const link = node('a', 'button button-outline', 'Открыть заказ в «Моих заказах»');
+  link.href = '/orders/?order=' + encodeURIComponent(orderId);
+  byId('order-feedback').append(document.createElement('br'), link);
 }
 async function checkout(send) {
   if (state.busy || !orderPayload().items.length) return;
-  const payload = orderPayload(); state.busy = true; updateActions(); feedback('order-feedback', '');
+  const payload = orderPayload();
+  const submittedStorageKey = storageKey;
+  const submittedProducts = new Map(payload.items.map(item => [item.product_id, { ...(state.cartProducts.get(item.product_id) || state.products.get(item.product_id)) }]));
+  state.busy = true; updateActions(); feedback('order-feedback', '');
   try {
     const response = await fetch('/api/orders/' + (send ? 'send' : 'export'), { method: 'POST', headers: { 'Content-Type': 'application/json', ...(state.user ? { 'X-Account-Id': state.user.id } : {}) }, body: JSON.stringify(payload) });
     if (!response.ok) throw await errorFor(response);
     if (send) {
-      await response.json();
+      const result = await response.json();
       state.sentSignature = JSON.stringify(payload);
-      feedback('order-feedback', 'Заказ отправлен. Excel-файл с выбранными товарами приложен к письму.' + (state.config?.history_ready ? ' Заказ сохранён в разделе «Заказы».' : ''));
+      const saved = result.order_saved === true && typeof result.order_id === 'string' && Boolean(result.order_id);
+      if (saved) removeCompletedItems(payload, submittedProducts, submittedStorageKey);
+      completedOrderFeedback(true, result.order_id, saved);
     } else {
       const blob = await response.blob();
       const url = URL.createObjectURL(blob);
@@ -377,7 +430,10 @@ async function checkout(send) {
       const filename = disposition.match(/filename="?([^";]+)"?/i);
       link.href = url; link.download = filename ? filename[1] : 'Заказ.xlsx';
       document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 10000);
-      notify(response.headers.get('X-Order-Saved') === 'true' ? 'Excel готов. Заказ сохранён в разделе «Заказы».' : 'Excel-заказ подготовлен для скачивания.');
+      const orderId = response.headers.get('X-Order-Id');
+      const saved = response.headers.get('X-Order-Saved') === 'true' && Boolean(orderId);
+      if (saved) removeCompletedItems(payload, submittedProducts, submittedStorageKey);
+      completedOrderFeedback(false, orderId, saved);
     }
   } catch (error) {
     feedback('order-feedback', error.message || 'Нет связи с сайтом. Попробуйте ещё раз.', true);
@@ -390,6 +446,7 @@ async function checkout(send) {
   } finally { state.busy = false; updateActions(); }
 }
 function openUpload() {
+  if (state.busy) return;
   feedback('upload-feedback', '');
   if (state.config && !state.config.upload_enabled) feedback('upload-feedback', 'Загрузка прайса пока не подключена. Обратитесь к владельцу сайта.', true);
   byId('upload-submit').disabled = !state.config?.upload_enabled;
@@ -398,6 +455,7 @@ function openUpload() {
 function closeUpload() { byId('upload-dialog').close(); byId('admin-password').value = ''; }
 async function upload(event) {
   event.preventDefault();
+  if (state.busy) return;
   const file = byId('price-file').files[0];
   if (!file || !state.config?.upload_enabled) return;
   if (!/\.(xlsx|xls)$/i.test(file.name)) { feedback('upload-feedback', 'Выберите Excel-файл в формате XLSX или XLS.', true); return; }
@@ -448,9 +506,9 @@ async function start() {
 byId('search').addEventListener('input', () => { clearTimeout(searchTimer); searchTimer = setTimeout(filterProducts, 60); });
 byId('load-more').addEventListener('click', () => { state.shown += 60; renderProducts(); });
 for (const field of ['name', 'price']) byId('sort-' + field)?.addEventListener('click', () => sortProducts(field));
-byId('clear-cart').addEventListener('click', () => { byId('clear-cart-dialog').showModal(); byId('clear-cart-cancel').focus(); });
+byId('clear-cart').addEventListener('click', () => { if (state.busy) return; byId('clear-cart-dialog').showModal(); byId('clear-cart-cancel').focus(); });
 for (const id of ['clear-cart-cancel', 'clear-cart-close']) byId(id).addEventListener('click', () => byId('clear-cart-dialog').close());
-byId('clear-cart-confirm').addEventListener('click', () => { state.cart.clear(); state.cartProducts.clear(); basketChanged(); renderCart(); byId('clear-cart-dialog').close(); });
+byId('clear-cart-confirm').addEventListener('click', () => { if (state.busy) return; state.cart.clear(); state.cartProducts.clear(); basketChanged(); renderCart(); byId('clear-cart-dialog').close(); });
 byId('customer-form').addEventListener('input', () => { state.sentSignature = null; saveCart(); updateActions(); });
 byId('customer-form').addEventListener('submit', (event) => event.preventDefault());
 byId('send-order').addEventListener('click', () => checkout(true));

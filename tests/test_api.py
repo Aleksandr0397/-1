@@ -486,7 +486,8 @@ with TestClient(app) as client:
         attachments = list(parsed.iter_attachments())
         self.assertEqual(len(attachments), 1)
         self.assertTrue(attachments[0].get_filename().endswith(".xlsx"))
-        self.assertEqual(set(response.json()), {"ok", "order_id"})
+        self.assertEqual(set(response.json()), {"ok", "order_id", "order_saved"})
+        self.assertIs(response.json()["order_saved"], False)
         sheet = load_workbook(io.BytesIO(attachments[0].get_payload(decode=True))).active
         values = [cell.value for row in sheet for cell in row]
         self.assertIn("Кабель медный Ёлка", values)

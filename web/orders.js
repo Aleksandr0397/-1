@@ -2,6 +2,7 @@
 const el = (id) => document.getElementById(id);
 const money = new Intl.NumberFormat('ru-RU', { style: 'currency', currency: 'RUB', maximumFractionDigits: 2 });
 const dates = new Intl.DateTimeFormat('ru-RU', { dateStyle: 'long', timeStyle: 'short' });
+const requestedOrderId = new URLSearchParams(window.location.search).get('order');
 let mode = 'login';
 let nextOffset = null;
 let currentUser = null;
@@ -79,6 +80,7 @@ async function download(order) {
 function orderCard(order) {
   const card = node('article', 'history-card');
   card.dataset.orderId = order.id;
+  if (order.id === requestedOrderId) card.setAttribute('aria-label', 'Только что оформленный заказ');
   const heading = node('div', 'history-card-heading');
   const created = new Date(order.created_at);
   heading.append(node('h2', '', 'Заказ от ' + (Number.isNaN(created.getTime()) ? order.created_at : dates.format(created))), node('strong', '', money.format(Number(order.total))));
@@ -160,6 +162,10 @@ async function loadOrders(append = false) {
   nextOffset = result.next_offset;
   el('history-more').hidden = nextOffset === null || nextOffset === undefined;
   el('history-empty').hidden = result.total > 0;
+  if (!append && requestedOrderId) {
+    const selected = Array.from(el('history-list').children).find(card => card.dataset.orderId === requestedOrderId);
+    if (selected) { selected.tabIndex = -1; selected.focus({ preventScroll: true }); selected.scrollIntoView({ block: 'center' }); }
+  }
 }
 async function start() {
   try {
