@@ -31,10 +31,11 @@ from fastapi.staticfiles import StaticFiles
 from openpyxl import Workbook, load_workbook
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.styles import Alignment, Font, PatternFill
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from starlette.datastructures import Headers
 
 import account_store
+from db_initialization import run_once
 
 load_dotenv(Path(__file__).with_name(".env"))
 logger = logging.getLogger(__name__)
@@ -128,10 +129,12 @@ def database():
     if account_store.postgres_configured():
         try:
             with account_store.postgres_database() as connection:
-                connection.execute("BEGIN IMMEDIATE")
-                connection.executescript(CATALOG_SCHEMA)
-                connection.commit()
-                bootstrap_catalog(connection)
+                def initialize_catalog():
+                    connection.execute("BEGIN IMMEDIATE")
+                    connection.executescript(CATALOG_SCHEMA)
+                    connection.commit()
+                    bootstrap_catalog(connection)
+                run_once(os.environ["ORDERS_DATABASE_URL"].strip(), "catalog", initialize_catalog)
                 yield connection
         except HTTPException:
             raise
@@ -453,6 +456,61 @@ class OrderRequest(BaseModel):
     catalog_version: str = Field(min_length=1, max_length=100)
     customer: Customer
     items: list[OrderItem] = Field(min_length=1, max_length=500)
+    cart_revision: int | None = Field(default=None, ge=0, strict=True)
+
+
+class CartProduct(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    id: str = Field(min_length=1, max_length=100)
+    name: str = Field(min_length=1, max_length=500)
+    sku: str = Field(max_length=100)
+    unit: str = Field(max_length=50)
+    price: str = Field(max_length=12)
+    previous_price: str | None = Field(default=None, max_length=12)
+    available: bool = True
+    restocked: bool = False
+    unresolved: bool = False
+    source_version: str | None = Field(default=None, max_length=100)
+
+    @field_validator("price", "previous_price")
+    @classmethod
+    def fixed_price(cls, value):
+        if value is not None and not re.fullmatch(r"(?:0|[1-9][0-9]{0,8})\.[0-9]{2}", value):
+            raise ValueError("Цена должна быть десятичной строкой с двумя знаками после точки.")
+        return value
+
+
+class CartItem(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    product_id: str = Field(min_length=1, max_length=100)
+    quantity: int = Field(ge=1, le=999999)
+    product: CartProduct
+
+    @model_validator(mode="after")
+    def matching_product(self):
+        if self.product_id != self.product.id:
+            raise ValueError("Идентификатор товара не совпадает с позицией корзины.")
+        return self
+
+
+class AccountCartDocument(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    catalog_version: str | None = Field(max_length=100)
+    customer: Customer
+    items: list[CartItem] = Field(max_length=500)
+
+    @field_validator("items")
+    @classmethod
+    def unique_products(cls, value):
+        if len({item.product_id for item in value}) != len(value):
+            raise ValueError("Товар повторяется в корзине.")
+        return value
+
+
+class AccountCartUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    revision: int = Field(ge=0)
+    cart: AccountCartDocument
 
 
 def prepare_order(order):
@@ -550,6 +608,8 @@ def storage_call(function, *args):
         raise HTTPException(401, "Сессия завершена. Войдите в аккаунт ещё раз.") from None
     except account_store.IncorrectPassword:
         raise HTTPException(400, "Текущий пароль указан неверно.") from None
+    except account_store.CartConflict:
+        raise
     except Exception as error:
         logger.warning("Account storage unavailable (%s)", type(error).__name__)
         raise HTTPException(503, "Постоянная история заказов временно недоступна. Попробуйте позже.") from None
@@ -572,11 +632,21 @@ def checkout_account(request):
     return user
 
 
-def remember_order(user, order, document, filename, order_id, total, selected, created_at, status):
+@app.exception_handler(account_store.CartConflict)
+async def cart_conflict_error(request: Request, error: account_store.CartConflict):
+    return JSONResponse({"code": "cart_conflict", "detail": "Корзина изменилась на другом устройстве. Проверьте обновлённый заказ.",
+                         **error.state}, status_code=409, headers={"Cache-Control": "no-store"})
+
+
+def remember_order(user, order, document, filename, order_id, total, selected, created_at, status, session_token=None):
     if user is None:
         return
     positions = [{"name": product["name"], "unit": product["unit"], "price": product["price"],
                   "quantity": product["quantity"], "line_total": str(product["line_total"])} for product in selected]
+    if order.cart_revision is not None:
+        return storage_call(account_store.save_order_with_cart, user["id"], session_token, order.cart_revision,
+                            [item.model_dump() for item in order.items], order_id, created_at.isoformat(), filename,
+                            status, str(total), positions, order.customer.model_dump(), document)
     storage_call(account_store.save_order, user["id"], order_id, created_at.isoformat(), filename,
                  status, str(total), positions, order.customer.model_dump(), document)
 
@@ -584,11 +654,18 @@ def remember_order(user, order, document, filename, order_id, total, selected, c
 @app.post("/api/orders/export")
 def export_order(order: OrderRequest, request: Request):
     user = checkout_account(request)
+    if order.cart_revision is not None and user is None:
+        raise HTTPException(503, "Общая корзина аккаунта ещё не настроена.")
     document, filename, order_id, total, selected, created_at = order_document(order)
-    remember_order(user, order, document, filename, order_id, total, selected, created_at, "exported")
+    completion = remember_order(user, order, document, filename, order_id, total, selected, created_at, "exported",
+                                request.cookies.get("okunev_session"))
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"', "X-Order-Id": order_id,
+               "X-Order-Saved": "true" if user else "false"}
+    if completion is not None:
+        headers.update({"X-Cart-Revision": str(completion["cart_revision"]),
+                        "X-Cart-Completed": "true" if completion["cart_completed"] else "false"})
     return Response(document, media_type=MIME_XLSX,
-                    headers={"Content-Disposition": f'attachment; filename="{filename}"', "X-Order-Id": order_id,
-                             "X-Order-Saved": "true" if user else "false"})
+                    headers=headers)
 
 
 def valid_email(value):
@@ -630,10 +707,12 @@ def config():
 @app.post("/api/orders/send")
 def send_order(order: OrderRequest, request: Request):
     user = checkout_account(request)
+    if order.cart_revision is not None and user is None:
+        raise HTTPException(503, "Общая корзина аккаунта ещё не настроена.")
     document, filename, order_id, total, selected, created_at = order_document(order)
     settings = mail_settings()
     remember_order(user, order, document, filename, order_id, total, selected, created_at,
-                   "pending" if settings else "failed")
+                   "pending" if settings else "failed", request.cookies.get("okunev_session"))
     if settings is None:
         raise HTTPException(503, "Отправка на почту ещё не настроена. Скачайте Excel-заказ или обратитесь к владельцу.")
     message = EmailMessage()
@@ -664,9 +743,13 @@ def send_order(order: OrderRequest, request: Request):
             storage_call(account_store.update_order_status, user["id"], order_id, "failed")
         logger.warning("Order email failed (%s), order_id=%s", type(error).__name__, order_id)
         raise HTTPException(502, "Не удалось отправить письмо. Заказ сохранён в корзине. Попробуйте позже или скачайте Excel.") from error
-    if user:
+    completion = None
+    if user and order.cart_revision is not None:
+        completion = storage_call(account_store.finish_sent_order, user["id"], request.cookies.get("okunev_session"),
+                                  order_id, order.cart_revision, [item.model_dump() for item in order.items])
+    elif user:
         storage_call(account_store.update_order_status, user["id"], order_id, "sent")
-    return {"ok": True, "order_id": order_id, "order_saved": bool(user)}
+    return {"ok": True, "order_id": order_id, "order_saved": bool(user), **(completion or {})}
 
 
 class AccountCredentials(BaseModel):
@@ -733,6 +816,25 @@ def update_account_profile(details: AccountProfile, request: Request, x_account_
         raise HTTPException(409, "Аккаунт изменился. Обновите страницу и войдите в нужный аккаунт.")
     return JSONResponse({"profile": storage_call(account_store.save_profile, user, details.model_dump())},
                         headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/accounts/cart")
+def account_cart(request: Request, x_account_id: str | None = Header(default=None)):
+    user = require_account(request)
+    if x_account_id is not None and x_account_id != user["id"]:
+        raise HTTPException(409, "Аккаунт изменился. Обновите страницу и войдите в нужный аккаунт.")
+    return JSONResponse(storage_call(account_store.cart, user["id"]), headers={"Cache-Control": "no-store"})
+
+
+@app.put("/api/accounts/cart")
+def update_account_cart(details: AccountCartUpdate, request: Request, x_account_id: str | None = Header(default=None)):
+    user = require_account(request)
+    if x_account_id is not None and x_account_id != user["id"]:
+        raise HTTPException(409, "Аккаунт изменился. Обновите страницу и войдите в нужный аккаунт.")
+    document = details.cart.model_dump(exclude_unset=True)
+    document["customer"] = details.cart.customer.model_dump()
+    return JSONResponse(storage_call(account_store.save_cart, user["id"], request.cookies.get("okunev_session"),
+                                     details.revision, document), headers={"Cache-Control": "no-store"})
 
 
 @app.post("/api/accounts/register")

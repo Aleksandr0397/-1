@@ -80,6 +80,266 @@ class AccountTests(unittest.TestCase):
         self.assertEqual(response.headers["x-order-saved"], "true")
         return response
 
+    def cart_document(self, quantity=2, include_missing=True):
+        product = self.catalog["products"][0]
+        items = [{"product_id": product["id"], "quantity": quantity, "product": {
+            **product, "available": True, "previous_price": "10.00", "restocked": True}}]
+        if include_missing:
+            missing = {"id": "previous-catalog:missing", "name": "Ожидаемый товар", "sku": "wait-1", "unit": "шт",
+                       "price": "20.00", "available": False, "source_version": "previous-catalog"}
+            items.append({"product_id": missing["id"], "quantity": 7, "product": missing})
+        return {"catalog_version": self.catalog["catalog_version"],
+                "customer": {"name": "Покупатель", "contact": "Контакт", "comment": "Черновик"}, "items": items}
+
+    def save_cart(self, document=None, revision=0, client=None):
+        response = (client or self.client).put("/api/accounts/cart", json={
+            "revision": revision, "cart": document if document is not None else self.cart_document()})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        return response.json()
+
+    def shared_order(self, revision=1, quantity=2):
+        return {**self.order(quantity), "cart_revision": revision}
+
+    def test_cart_requires_account_and_mismatch_header_never_reads_or_overwrites_other_cart(self):
+        document = self.cart_document()
+        for method in ("get", "put"):
+            kwargs = {"json": {"revision": 0, "cart": document}} if method == "put" else {}
+            self.assertEqual(getattr(self.client, method)("/api/accounts/cart", **kwargs).status_code, 401)
+            with patch.dict(os.environ, {"ORDERS_HISTORY_DIR": ""}):
+                self.assertEqual(getattr(self.client, method)("/api/accounts/cart", **kwargs).status_code, 503)
+        user_a = self.register()
+        saved_a = self.save_cart(document)
+        user_b = self.register(self.other, "buyer-b@example.com")
+        self.assertEqual(self.other.get(f"/api/accounts/cart?user_id={user_a['id']}").json(), {"revision": 0, "cart": None})
+        for method in ("get", "put"):
+            kwargs = {"json": {"revision": 0, "cart": document}} if method == "put" else {}
+            response = getattr(self.other, method)("/api/accounts/cart", headers={"X-Account-Id": user_a["id"]}, **kwargs)
+            self.assertEqual(response.status_code, 409)
+        for injection in ({"user_id": user_a["id"]}, {"email": user_a["email"]}):
+            response = self.other.put("/api/accounts/cart", json={"revision": 0, "cart": document, **injection})
+            self.assertEqual(response.status_code, 422)
+        self.assertEqual(self.client.get("/api/accounts/cart").json(), saved_a)
+        self.assertEqual(self.other.get("/api/accounts/me").json()["user"], user_b)
+
+    def test_cart_cross_device_revision_conflict_and_saved_empty_draft_are_authoritative(self):
+        user = self.register()
+        initial = self.client.get("/api/accounts/cart")
+        self.assertEqual(initial.json(), {"revision": 0, "cart": None})
+        self.assertEqual(initial.headers["cache-control"], "no-store")
+        document = self.cart_document()
+        first = self.save_cart(document)
+        self.assertEqual(first, {"revision": 1, "cart": document})
+        self.assertEqual(self.other.post("/api/accounts/login", json={"email": user["email"], "password": PASSWORD}).status_code, 200)
+        self.assertEqual(self.other.get("/api/accounts/cart").json(), first)
+        empty = {**document, "items": []}
+        saved_empty = self.save_cart(empty, 1, self.other)
+        self.assertEqual(saved_empty, {"revision": 2, "cart": empty})
+        stale = self.client.put("/api/accounts/cart", json={"revision": 1, "cart": document})
+        self.assertEqual(stale.status_code, 409, stale.text)
+        self.assertEqual(stale.headers["cache-control"], "no-store")
+        self.assertEqual(stale.json()["code"], "cart_conflict")
+        self.assertEqual({key: stale.json()[key] for key in ("revision", "cart")}, saved_empty)
+        self.assertEqual(self.client.get("/api/accounts/cart").json(), saved_empty)
+
+    def test_cart_survives_new_process_and_does_not_change_catalog_profile_or_old_orders(self):
+        user = self.register()
+        exported = self.exported()
+        profile = self.profile(name="Имя", company="Компания")
+        self.client.put("/api/accounts/profile", json=profile)
+        saved = self.save_cart()
+        code = """
+import json,sys
+from fastapi.testclient import TestClient
+from app import app
+data=json.load(sys.stdin)
+with TestClient(app) as client:
+    assert client.post('/api/accounts/login',json={'email':data['email'],'password':data['password']}).status_code==200
+    response=client.get('/api/accounts/cart')
+    assert response.status_code==200
+    print(json.dumps(response.json()))
+"""
+        result = subprocess.run([sys.executable, "-c", code], cwd=Path(__file__).resolve().parents[1],
+                                input=json.dumps({"email": user["email"], "password": PASSWORD}),
+                                text=True, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), saved)
+        self.assertEqual(self.client.get("/api/accounts/profile").json()["profile"], {"email": user["email"], **profile})
+        self.assertEqual(self.client.get("/api/catalog").json()["products"], self.catalog["products"])
+        self.assertEqual(self.client.get(f"/api/orders/history/{exported.headers['x-order-id']}/file").content, exported.content)
+
+    def test_cart_validation_rejects_malformed_snapshots_and_preserves_saved_cart(self):
+        self.register()
+        document = self.cart_document()
+        saved = self.save_cart(document)
+        invalid = []
+        for quantity in (True, 0, -1, 1000000, 1.5, "2", None):
+            bad = json.loads(json.dumps(document))
+            bad["items"][0]["quantity"] = quantity
+            invalid.append(bad)
+        for key, value in (("id", "wrong-id"), ("price", "1e3"), ("price", "1,00"),
+                           ("price", "1000000000.00"), ("price", "NaN"), ("price", 12.5),
+                           ("previous_price", "1.001"), ("name", "x" * 501), ("sku", "x" * 101),
+                           ("unit", "x" * 51), ("available", "false"), ("owner_id", "other-user")):
+            bad = json.loads(json.dumps(document))
+            bad["items"][0]["product"][key] = value
+            invalid.append(bad)
+        invalid.extend(({**document, "items": document["items"] * 2}, {**document, "user_id": "injected"},
+                        {**document, "customer": {"name": "x" * 161}},
+                        {**document, "customer": {"contact": "x" * 201}},
+                        {**document, "customer": {"comment": "x" * 2001}},
+                        {**document, "items": [{**document["items"][0], "product_id": str(index)} for index in range(501)]}))
+        for bad in invalid:
+            with self.subTest(document=bad):
+                self.assertEqual(self.client.put("/api/accounts/cart", json={"revision": 1, "cart": bad}).status_code, 422)
+        for revision in (True, -1, 1.5, "1"):
+            self.assertEqual(self.client.put("/api/accounts/cart", json={"revision": revision, "cart": document}).status_code, 422)
+        self.assertEqual(self.client.get("/api/accounts/cart").json(), saved)
+
+    def test_cart_write_rechecks_revoked_session_inside_transaction(self):
+        self.register()
+        token = self.client.cookies.get("okunev_session")
+        original = account_store.save_cart
+
+        def revoke_then_save(*args):
+            account_store.logout(token)
+            return original(*args)
+
+        with patch("account_store.save_cart", side_effect=revoke_then_save):
+            response = self.client.put("/api/accounts/cart", json={"revision": 0, "cart": self.cart_document()})
+        self.assertEqual(response.status_code, 401, response.text)
+        with sqlite3.connect(Path(self.history_dir) / "accounts.sqlite3") as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM account_carts").fetchone()[0], 0)
+
+    def test_simultaneous_cart_writes_have_one_winner_and_one_explicit_conflict(self):
+        user = self.register()
+        self.assertEqual(self.other.post("/api/accounts/login", json={"email": user["email"], "password": PASSWORD}).status_code, 200)
+        left, right = self.cart_document(2), self.cart_document(3)
+        def save(client, document):
+            response = client.put("/api/accounts/cart", json={"revision": 0, "cart": document})
+            return response.status_code, response.json()
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(save, client, document) for client, document in ((self.client, left), (self.other, right))]
+            results = [future.result(timeout=20) for future in futures]
+        self.assertEqual(sorted(status for status, _ in results), [200, 409])
+        winner = next(body for status, body in results if status == 200)
+        conflict = next(body for status, body in results if status == 409)
+        self.assertEqual({key: conflict[key] for key in ("revision", "cart")}, winner)
+        self.assertEqual(self.client.get("/api/accounts/cart").json(), winner)
+
+    def test_shared_export_atomically_archives_and_clears_only_submitted_quantities(self):
+        self.register()
+        document = self.cart_document(quantity=5)
+        self.save_cart(document)
+        response = self.client.post("/api/orders/export", json=self.shared_order(quantity=2))
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.headers["x-cart-completed"], "true")
+        self.assertEqual(response.headers["x-cart-revision"], "2")
+        expected = json.loads(json.dumps(document))
+        expected["items"][0]["quantity"] = 3
+        self.assertEqual(self.client.get("/api/accounts/cart").json(), {"revision": 2, "cart": expected})
+        workbook = load_workbook(io.BytesIO(response.content), data_only=True)
+        self.assertEqual(workbook["Заказ"]["B3"].value, 2)
+        self.assertEqual(workbook["Заказ"]["D3"].value, 12.5)
+        self.assertEqual(self.client.get(f"/api/orders/history/{response.headers['x-order-id']}/file").content, response.content)
+        history_before = self.client.get("/api/orders/history").json()
+        stale = self.client.post("/api/orders/export", json=self.shared_order(quantity=2))
+        self.assertEqual(stale.status_code, 409)
+        self.assertEqual(stale.json()["code"], "cart_conflict")
+        self.assertEqual(self.client.get("/api/orders/history").json(), history_before)
+        self.assertEqual(self.client.get("/api/accounts/cart").json()["cart"], expected)
+
+    def test_shared_export_clears_available_keeps_missing_and_never_trusts_snapshot_prices(self):
+        self.register()
+        document = self.cart_document()
+        document["items"][0]["product"]["price"] = "0.00"
+        self.save_cart(document)
+        response = self.client.post("/api/orders/export", json=self.shared_order())
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.client.get("/api/accounts/cart").json(), {
+            "revision": 2, "cart": {**document, "items": [document["items"][1]]}})
+        workbook = load_workbook(io.BytesIO(response.content), data_only=True)
+        self.assertEqual(workbook["Заказ"]["D3"].value, 12.5)
+        self.assertEqual(workbook["Заказ"].max_row, 4)
+
+    def test_shared_checkout_conflicts_do_not_archive_or_send_and_legacy_orders_do_not_touch_cart(self):
+        self.register()
+        saved = self.save_cart(quantity_document := self.cart_document(quantity=1))
+        for endpoint in ("/api/orders/export", "/api/orders/send"):
+            for order in (self.shared_order(0), self.shared_order(1, quantity=2)):
+                with patch("app.smtplib.SMTP", autospec=True) as smtp:
+                    response = self.client.post(endpoint, json=order)
+                self.assertEqual(response.status_code, 409, response.text)
+                self.assertEqual(response.json()["code"], "cart_conflict")
+                smtp.assert_not_called()
+        self.assertEqual(self.client.get("/api/orders/history").json()["total"], 0)
+        self.assertEqual(self.client.get("/api/accounts/cart").json(), saved)
+        legacy = self.exported()
+        self.assertNotIn("x-cart-revision", legacy.headers)
+        self.assertEqual(self.client.get("/api/accounts/cart").json(), saved)
+        unavailable = json.loads(json.dumps(quantity_document))
+        unavailable["items"][0]["product"]["available"] = False
+        self.save_cart(unavailable, 1)
+        response = self.client.post("/api/orders/export", json=self.shared_order(2, quantity=1))
+        self.assertEqual(response.status_code, 409, response.text)
+
+    def test_shared_export_rolls_back_archive_and_cart_when_completion_write_fails(self):
+        self.register()
+        saved = self.save_cart()
+        original = account_store.write_cart
+        def fail_after_write(*args):
+            original(*args)
+            raise OSError("private cart storage failure")
+        with patch("account_store.write_cart", side_effect=fail_after_write):
+            response = self.client.post("/api/orders/export", json=self.shared_order())
+        self.assertEqual(response.status_code, 503, response.text)
+        self.assertNotIn("private cart storage failure", response.text)
+        self.assertEqual(self.client.get("/api/orders/history").json()["total"], 0)
+        self.assertEqual(self.client.get("/api/accounts/cart").json(), saved)
+
+    def test_shared_send_success_clears_available_and_failure_keeps_draft(self):
+        self.register()
+        saved = self.save_cart()
+        settings = {"SMTP_HOST": "smtp.example.com", "SMTP_FROM": "sender@example.com", "ORDERS_TO": "owner@example.com"}
+        with patch.dict(os.environ, settings), patch("app.smtplib.SMTP", side_effect=smtplib.SMTPException("failure")):
+            failed = self.client.post("/api/orders/send", json=self.shared_order())
+        self.assertEqual(failed.status_code, 502, failed.text)
+        self.assertEqual(self.client.get("/api/accounts/cart").json(), saved)
+        with patch.dict(os.environ, settings), patch("app.smtplib.SMTP", autospec=True) as smtp:
+            smtp.return_value.__enter__.return_value.send_message.return_value = {}
+            sent = self.client.post("/api/orders/send", json=self.shared_order())
+        self.assertEqual(sent.status_code, 200, sent.text)
+        self.assertEqual(sent.json()["cart_revision"], 2)
+        self.assertIs(sent.json()["cart_completed"], True)
+        self.assertEqual(self.client.get("/api/accounts/cart").json()["cart"]["items"], [saved["cart"]["items"][1]])
+        self.assertEqual({order["status"] for order in self.client.get("/api/orders/history").json()["orders"]}, {"failed", "sent"})
+
+    def test_shared_send_newer_device_draft_is_retained_but_success_is_recorded(self):
+        user = self.register()
+        self.save_cart()
+        self.other.post("/api/accounts/login", json={"email": user["email"], "password": PASSWORD})
+        newer = self.cart_document(quantity=9)
+        def update_during_send(*args, **kwargs):
+            self.save_cart(newer, revision=1, client=self.other)
+            return {}
+        settings = {"SMTP_HOST": "smtp.example.com", "SMTP_FROM": "sender@example.com", "ORDERS_TO": "owner@example.com"}
+        with patch.dict(os.environ, settings), patch("app.smtplib.SMTP", autospec=True) as smtp:
+            smtp.return_value.__enter__.return_value.send_message.side_effect = update_during_send
+            response = self.client.post("/api/orders/send", json=self.shared_order())
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIs(response.json()["cart_completed"], False)
+        self.assertEqual(response.json()["cart_revision"], 2)
+        self.assertEqual(self.client.get("/api/accounts/cart").json(), {"revision": 2, "cart": newer})
+        self.assertEqual(self.client.get("/api/orders/history").json()["orders"][0]["status"], "sent")
+
+    def test_shared_send_unconfigured_mail_never_clears_cart(self):
+        self.register()
+        saved = self.save_cart()
+        response = self.client.post("/api/orders/send", json=self.shared_order())
+        self.assertEqual(response.status_code, 503, response.text)
+        self.assertEqual(self.client.get("/api/accounts/cart").json(), saved)
+        self.assertEqual(self.client.get("/api/orders/history").json()["orders"][0]["status"], "failed")
+
     def test_disabled_history_is_honest_and_legacy_checkout_remains_anonymous(self):
         with patch.dict(os.environ, {"ORDERS_HISTORY_DIR": ""}):
             self.assertEqual(self.client.get("/api/accounts/me").json(), {"available": False, "user": None})

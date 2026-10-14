@@ -5,6 +5,13 @@ const state = { config: null, user: null, catalog: { catalog_version: null, prod
 const legacyStorageKey = 'okunev-order-cart-v1';
 const guestStorageKey = 'okunev-order-cart-v2:guest';
 let storageKey = null;
+let accountCart = null;
+let initialising = true;
+let applyingAccountCart = false;
+let catalogVerified = false;
+let localCartMetadata = null;
+let syncMessageTimer;
+const catalogCacheKey = 'okunev-public-catalog-v1';
 const fullCart = document.body.dataset.view === 'cart';
 const money = new Intl.NumberFormat('ru-RU', { style: 'currency', currency: 'RUB', minimumFractionDigits: 0, maximumFractionDigits: 2 });
 const wholeNumbers = new Intl.NumberFormat('ru-RU');
@@ -44,13 +51,93 @@ async function errorFor(response) {
   return error;
 }
 async function jsonApi(url, options) {
-  const response = await fetch(url, options);
+  const response = await fetch(url, { cache: 'no-store', ...options });
   if (!response.ok) throw await errorFor(response);
   return response.json();
 }
+function cartDocument() {
+  return { catalog_version: state.catalog.catalog_version, customer: customerFields(), items: Array.from(state.cart, ([product_id, quantity]) => {
+    const source = state.cartProducts.get(product_id) || state.products.get(product_id) || { id: product_id, name: 'Товар из предыдущего прайса', sku: '', unit: '', price: '0.00', unresolved: true };
+    const product = {};
+    for (const field of ['id', 'name', 'sku', 'unit', 'price', 'available', 'previous_price', 'restocked', 'unresolved', 'source_version']) if (source[field] !== undefined && source[field] !== null) product[field] = source[field];
+    return { product_id, quantity, product };
+  }) };
+}
+function readLocalCart() {
+  try { return JSON.parse(localStorage.getItem(storageKey) || 'null'); } catch (_) { return null; }
+}
+function writeLocalCart() {
+  if (!storageKey || initialising) return;
+  if (accountCart?.ready) localCartMetadata = { revision: accountCart.revision, pending: accountCart.pending };
+  try { localStorage.setItem(storageKey, JSON.stringify({ ...cartDocument(), ...(localCartMetadata ? { _shared: localCartMetadata } : {}) })); } catch (_) { /* A server cart also works without browser storage. */ }
+}
 function saveCart() {
-  if (!storageKey) return;
-  try { localStorage.setItem(storageKey, JSON.stringify({ catalog_version: state.catalog.catalog_version, customer: customerFields(), items: Array.from(state.cart, ([product_id, quantity]) => ({ product_id, quantity, product: state.cartProducts.get(product_id) || state.products.get(product_id) })) })); } catch (_) { /* The basket still works when browser storage is unavailable. */ }
+  if (accountCart?.ready && !initialising && !applyingAccountCart && catalogVerified && (accountCart.pending || !accountCart.matches(cartDocument()))) accountCart.schedule();
+  writeLocalCart();
+}
+function cartEditable() {
+  return Boolean(storageKey) && !initialising && !applyingAccountCart && catalogVerified && (!state.user || Boolean(accountCart?.ready));
+}
+function cartContext() {
+  const key = storageKey, owner = state.user?.id, controller = accountCart;
+  return () => Boolean(key) && storageKey === key && state.user?.id === owner && accountCart === controller;
+}
+function cartSyncStatus(kind, text) {
+  clearTimeout(syncMessageTimer);
+  feedback('cart-sync-feedback', text || '', kind === 'error' || kind === 'conflict');
+  byId('cart-sync-retry').hidden = kind !== 'error';
+  updateActions();
+  if (kind === 'saved') writeLocalCart();
+  if (kind === 'saved') syncMessageTimer = setTimeout(() => feedback('cart-sync-feedback', ''), 2500);
+}
+async function applyAccountCart(document) {
+  const current = cartContext();
+  applyingAccountCart = true;
+  updateActions();
+  try {
+    state.cart.clear(); state.cartProducts.clear();
+    for (const field of ['name', 'contact', 'comment']) byId('customer-' + field).value = '';
+    await restoreCart(document || { items: [], customer: {} });
+    if (!current()) return;
+    if (!initialising && document?.catalog_version && document.catalog_version !== state.catalog.catalog_version) await loadCatalog(false);
+    if (!current()) return;
+    if (state.catalog.catalog_version) reconcileCart();
+    renderCart();
+  } finally { applyingAccountCart = false; updateActions(); }
+}
+function accountCartAuthError(ownerId) {
+  if (state.user?.id !== ownerId) return;
+  accountCart?.dispose(); accountCart = null; storageKey = null;
+  state.user = null; state.cart.clear(); state.cartProducts.clear();
+  for (const field of ['name', 'contact', 'comment']) byId('customer-' + field).value = '';
+  byId('account-link').textContent = 'Войти'; renderCart();
+  feedback('order-feedback', '');
+  feedback('cart-sync-feedback', 'Аккаунт изменился или вход завершён. Обновите страницу и войдите в свой аккаунт.', true);
+  byId('cart-sync-retry').hidden = false;
+}
+async function initialiseAccountCart(local) {
+  const ownerId = state.user.id;
+  if (local?.items?.length && !local._shared) {
+    try { localStorage.setItem(storageKey + ':before-sync', JSON.stringify(local)); } catch (_) { /* Server state remains authoritative. */ }
+  }
+  accountCart = new window.AccountCartSync({
+    ownerId, getDocument: cartDocument, applyDocument: applyAccountCart,
+    onStatus: cartSyncStatus, onAcknowledged: writeLocalCart,
+    onConflict: (document) => { try { localStorage.setItem(storageKey + ':conflict', JSON.stringify(document)); } catch (_) { /* Keep server state authoritative. */ } },
+    onAuthError: () => accountCartAuthError(ownerId),
+  });
+  const recovery = local?._shared?.pending && Number.isInteger(local._shared.revision) ? { revision: local._shared.revision, cart: cartDocument() } : null;
+  await accountCart.load({ migration: local && !local._shared ? cartDocument() : null, pending: recovery });
+}
+function cachedCatalog() {
+  try {
+    const cached = JSON.parse(sessionStorage.getItem(catalogCacheKey) || 'null');
+    if (cached && typeof cached.catalog_version === 'string' && Array.isArray(cached.products) && cached.products.length <= 20000 && cached.products.every(product => validSnapshot(product, product.id))) return cached;
+  } catch (_) { /* The public cache is optional. */ }
+  return null;
+}
+function cacheCatalog(catalog) {
+  try { sessionStorage.setItem(catalogCacheKey, JSON.stringify(catalog)); } catch (_) { /* Continue without a catalog cache. */ }
 }
 function selectCartStorage() {
   storageKey = state.user ? 'okunev-order-cart-v2:user:' + state.user.id : guestStorageKey;
@@ -75,15 +162,12 @@ function selectCartStorage() {
 function validSnapshot(product, id) {
   return product && product.id === id && typeof product.name === 'string' && product.name.length <= 500 && typeof product.sku === 'string' && product.sku.length <= 100 && typeof product.unit === 'string' && product.unit.length <= 50 && /^\d{1,9}\.\d{2}$/.test(product.price);
 }
-async function restoreCart() {
+async function restoreCart(document) {
   if (!storageKey) return;
+  const current = cartContext();
   try {
-    const saved = JSON.parse(localStorage.getItem(storageKey) || 'null');
+    const saved = document === undefined ? readLocalCart() : document;
     if (!saved) return;
-    for (const field of ['name', 'contact', 'comment']) {
-      const input = byId('customer-' + field);
-      if (typeof saved.customer?.[field] === 'string') input.value = saved.customer[field].slice(0, input.maxLength);
-    }
     const recovered = new Map();
     const items = Array.isArray(saved.items) ? saved.items.slice(0, 500) : [];
     const versions = new Set(items.filter(item => !state.products.has(item.product_id) && (!validSnapshot(item.product, item.product_id) || item.product.unresolved)).map(item => item.product?.source_version || saved.catalog_version));
@@ -91,8 +175,14 @@ async function restoreCart() {
       if (typeof version !== 'string' || !version || version.length > 100) continue;
       try {
         const archive = await jsonApi('/api/catalog/versions/' + encodeURIComponent(version));
+        if (!current()) return;
         for (const product of archive.products) recovered.set(product.id, { ...product, source_version: version });
       } catch (_) { /* Keep unresolved rows, including their original ID and quantity. */ }
+    }
+    if (!current()) return;
+    for (const field of ['name', 'contact', 'comment']) {
+      const input = byId('customer-' + field);
+      if (typeof saved.customer?.[field] === 'string') input.value = saved.customer[field].slice(0, input.maxLength);
     }
     let removedFractional = false;
     for (const item of items) {
@@ -147,7 +237,7 @@ function validQuantity(value) { const number = Number(value); return Number.isIn
 function quantityInput(product, value, className) {
   const input = node('input', className);
   input.type = 'number'; input.min = '1'; input.max = '999999'; input.step = '1'; input.value = String(value);
-  input.disabled = state.busy;
+  input.disabled = state.busy || !cartEditable();
   input.dataset.productId = product.id;
   input.inputMode = 'numeric'; input.setAttribute('aria-label', 'Количество: ' + product.name);
   input.addEventListener('keydown', (event) => { if (['.', ',', 'e', 'E', '-', '+'].includes(event.key)) event.preventDefault(); });
@@ -164,7 +254,7 @@ function quantityStepper(input) {
     button.setAttribute('aria-label', label + ': ' + input.getAttribute('aria-label').replace(/^Количество: /, ''));
     button.addEventListener('mousedown', (event) => event.preventDefault());
     button.addEventListener('click', () => {
-      if (state.busy) return;
+      if (state.busy || !cartEditable()) return;
       if (!validQuantity(input.value)) {
         input.setCustomValidity('Введите целое количество от 1 до 999 999.'); input.reportValidity(); return;
       }
@@ -176,7 +266,7 @@ function quantityStepper(input) {
       current?.closest('.quantity-stepper')?.querySelector(direction === 1 ? '.quantity-increase' : '.quantity-decrease')?.focus({ preventScroll: true });
     });
   }
-  function updateLimits() { up.disabled = state.busy || Number(input.value) >= 999999; down.disabled = state.busy || Number(input.value) <= 1; }
+  function updateLimits() { up.disabled = state.busy || !cartEditable() || Number(input.value) >= 999999; down.disabled = state.busy || !cartEditable() || Number(input.value) <= 1; }
   input.addEventListener('input', updateLimits); input.addEventListener('change', updateLimits);
   updateLimits(); arrows.append(up, down); wrapper.append(input, arrows);
   return wrapper;
@@ -195,7 +285,7 @@ async function setCatalog(catalog, restore = false) {
   for (const [id] of state.cart) if (!state.cartProducts.has(id) && state.products.has(id)) state.cartProducts.set(id, { ...state.products.get(id), source_version: previous });
   state.catalog = catalog;
   state.products = new Map(catalog.products.map((product) => [product.id, product]));
-  state.indexed = catalog.products.map((product) => ({ product, search: normalize(product.name + ' ' + (product.sku || '')) }));
+  state.indexed = fullCart ? [] : catalog.products.map((product) => ({ product, search: normalize(product.name + ' ' + (product.sku || '')) }));
   if (previous && previous !== catalog.catalog_version) {
     state.sentSignature = null;
     feedback('order-feedback', 'Прайс обновлён. Товары и количества сохранены; цены и наличие проверены по новому прайсу.');
@@ -205,7 +295,8 @@ async function setCatalog(catalog, restore = false) {
   saveCart();
   byId('catalog-count').textContent = plural(catalog.products.length);
   byId('filename').textContent = catalog.filename || 'Прайс пока не загружен';
-  filterProducts(); renderCart();
+  if (!fullCart) filterProducts();
+  renderCart();
 }
 function filterProducts() {
   const terms = normalize(byId('search').value).trim().split(/\s+/).filter(Boolean);
@@ -243,10 +334,10 @@ function renderProducts() {
     quantityCell.append(quantityStepper(input));
     const action = node('td');
     const button = node('button', 'button product-add', 'В заказ');
-    button.disabled = state.busy || !storageKey;
+    button.disabled = state.busy || !cartEditable();
     button.type = 'button'; button.setAttribute('aria-label', 'Добавить в заказ: ' + product.name);
     function add() {
-      if (state.busy) return;
+      if (state.busy || !cartEditable()) return;
       if (!storageKey) { notify('Обновите страницу, чтобы восстановить свой аккаунт и корзину.'); return; }
       const quantity = Number(input.value);
       if (!validQuantity(quantity)) { input.setCustomValidity('Введите целое количество от 1 до 999 999.'); input.reportValidity(); return; }
@@ -314,14 +405,14 @@ function renderCart() {
     const top = node('div', 'cart-top');
     const remove = node('button', 'icon-button', '×');
     remove.type = 'button'; remove.setAttribute('aria-label', 'Убрать из заказа: ' + product.name);
-    remove.disabled = state.busy;
-    remove.addEventListener('click', () => { if (state.busy) return; state.cart.delete(id); state.cartProducts.delete(id); basketChanged(); renderCart(); });
+    remove.disabled = state.busy || !cartEditable();
+    remove.addEventListener('click', () => { if (state.busy || !cartEditable()) return; state.cart.delete(id); state.cartProducts.delete(id); basketChanged(); renderCart(); });
     top.append(node('span', 'cart-name', product.name), remove);
     const controls = node('div', 'cart-controls');
     const wrap = node('div', 'cart-quantity-wrap');
     const input = quantityInput(product, quantity, 'cart-quantity');
     input.addEventListener('change', () => {
-      if (state.busy) { input.value = String(state.cart.get(id)); return; }
+      if (state.busy || !cartEditable()) { input.value = String(state.cart.get(id)); return; }
       if (!validQuantity(input.value)) { input.value = String(state.cart.get(id)); notify('Укажите целое количество от 1 до 999 999.'); return; }
       state.cart.set(id, Number(input.value)); basketChanged(); renderCart();
     });
@@ -354,26 +445,28 @@ function customerFields() {
   return { name: byId('customer-name').value.trim(), contact: byId('customer-contact').value.trim(), comment: byId('customer-comment').value.trim() };
 }
 function orderPayload() {
-  return { catalog_version: state.catalog.catalog_version, customer: customerFields(), items: Array.from(state.cart).filter(([id]) => state.products.has(id) && state.cartProducts.get(id)?.available !== false).map(([product_id, quantity]) => ({ product_id, quantity: String(quantity) })) };
+  return { catalog_version: state.catalog.catalog_version, customer: customerFields(), items: Array.from(state.cart).filter(([id]) => state.products.has(id) && state.cartProducts.get(id)?.available !== false).map(([product_id, quantity]) => ({ product_id, quantity: String(quantity) })), ...(accountCart?.ready ? { cart_revision: accountCart.revision } : {}) };
 }
 function updateActions() {
   const sent = state.sentSignature && state.sentSignature === JSON.stringify(orderPayload());
   const needsLogin = state.config?.history_ready && !state.user;
   const available = orderPayload().items.length;
-  byId('download-order').disabled = state.busy || !available || needsLogin || !storageKey;
-  byId('send-order').disabled = state.busy || !available || needsLogin || !storageKey || !state.config?.mail_ready || Boolean(sent);
+  const locked = state.busy || !cartEditable();
+  const saving = accountCart?.pending || accountCart?.saving;
+  byId('download-order').disabled = locked || saving || !available || needsLogin;
+  byId('send-order').disabled = locked || saving || !available || needsLogin || !state.config?.mail_ready || Boolean(sent);
   byId('send-order').textContent = state.busy ? 'Подождите…' : sent ? 'Заказ отправлен' : 'Отправить заказ';
-  byId('clear-cart').disabled = state.busy;
+  byId('clear-cart').disabled = locked;
   for (const id of ['open-upload', 'empty-upload']) byId(id).disabled = state.busy;
   for (const input of document.querySelectorAll('.quantity-stepper input')) {
-    input.disabled = state.busy;
+    input.disabled = locked;
     const wrapper = input.closest('.quantity-stepper');
-    wrapper.querySelector('.quantity-increase').disabled = state.busy || Number(input.value) >= 999999;
-    wrapper.querySelector('.quantity-decrease').disabled = state.busy || Number(input.value) <= 1;
+    wrapper.querySelector('.quantity-increase').disabled = locked || Number(input.value) >= 999999;
+    wrapper.querySelector('.quantity-decrease').disabled = locked || Number(input.value) <= 1;
   }
-  for (const button of document.querySelectorAll('.product-add')) button.disabled = state.busy || !storageKey;
-  for (const button of document.querySelectorAll('.cart-top .icon-button')) button.disabled = state.busy;
-  for (const input of byId('customer-form').querySelectorAll('input, textarea')) input.disabled = state.busy;
+  for (const button of document.querySelectorAll('.product-add')) button.disabled = locked;
+  for (const button of document.querySelectorAll('.cart-top .icon-button')) button.disabled = locked;
+  for (const input of byId('customer-form').querySelectorAll('input, textarea')) input.disabled = locked;
 }
 function removeCompletedItems(payload, submittedProducts, submittedStorageKey) {
   if (storageKey !== submittedStorageKey) return;
@@ -397,33 +490,46 @@ function removeCompletedItems(payload, submittedProducts, submittedStorageKey) {
   }
   saveCart(); renderCart();
 }
-function completedOrderFeedback(send, orderId, saved) {
+function completedOrderFeedback(send, orderId, saved, cleared = true) {
   if (!saved) {
     feedback('order-feedback', (send ? 'Заказ отправлен.' : 'Excel подготовлен для скачивания.') + ' Сохранение в «Моих заказах» не подтверждено. Корзина сохранена.', true);
     return;
   }
-  feedback('order-feedback', (send ? 'Заказ отправлен и сохранён в «Моих заказах».' : 'Excel готов. Заказ сохранён в «Моих заказах».') + ' Заказанные товары убраны из корзины; отсутствующие позиции остаются.');
+  feedback('order-feedback', (send ? 'Заказ отправлен и сохранён в «Моих заказах».' : 'Excel готов. Заказ сохранён в «Моих заказах».') + (cleared ? ' Заказанные товары убраны из корзины; отсутствующие позиции остаются.' : ' Корзина изменилась на другом устройстве и оставлена без очистки.'));
   const link = node('a', 'button button-outline', 'Открыть заказ в «Моих заказах»');
   link.href = '/orders/?order=' + encodeURIComponent(orderId);
   byId('order-feedback').append(document.createElement('br'), link);
 }
 async function checkout(send) {
-  if (state.busy || !orderPayload().items.length) return;
-  const payload = orderPayload();
-  const submittedStorageKey = storageKey;
-  const submittedProducts = new Map(payload.items.map(item => [item.product_id, { ...(state.cartProducts.get(item.product_id) || state.products.get(item.product_id)) }]));
+  if (state.busy || !cartEditable() || !orderPayload().items.length) return;
   state.busy = true; updateActions(); feedback('order-feedback', '');
   try {
+    if (accountCart) {
+      if (!accountCart.matches(cartDocument())) accountCart.schedule();
+      await accountCart.flush();
+    }
+    const payload = orderPayload();
+    const current = cartContext();
+    const submittedStorageKey = storageKey;
+    const submittedProducts = new Map(payload.items.map(item => [item.product_id, { ...(state.cartProducts.get(item.product_id) || state.products.get(item.product_id)) }]));
     const response = await fetch('/api/orders/' + (send ? 'send' : 'export'), { method: 'POST', headers: { 'Content-Type': 'application/json', ...(state.user ? { 'X-Account-Id': state.user.id } : {}) }, body: JSON.stringify(payload) });
     if (!response.ok) throw await errorFor(response);
+    if (!current()) return;
     if (send) {
       const result = await response.json();
+      if (!current()) return;
       state.sentSignature = JSON.stringify(payload);
       const saved = result.order_saved === true && typeof result.order_id === 'string' && Boolean(result.order_id);
-      if (saved) removeCompletedItems(payload, submittedProducts, submittedStorageKey);
-      completedOrderFeedback(true, result.order_id, saved);
+      if (saved && !accountCart) removeCompletedItems(payload, submittedProducts, submittedStorageKey);
+      if (saved && accountCart) {
+        try { await accountCart.refresh(); }
+        catch (_) { cartSyncStatus('error', 'Заказ сохранён. Не удалось обновить общую корзину — повторите загрузку.'); }
+      }
+      if (!current()) return;
+      completedOrderFeedback(true, result.order_id, saved, !accountCart || result.cart_completed === true);
     } else {
       const blob = await response.blob();
+      if (!current()) return;
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
       const disposition = response.headers.get('Content-Disposition') || '';
@@ -432,7 +538,12 @@ async function checkout(send) {
       document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 10000);
       const orderId = response.headers.get('X-Order-Id');
       const saved = response.headers.get('X-Order-Saved') === 'true' && Boolean(orderId);
-      if (saved) removeCompletedItems(payload, submittedProducts, submittedStorageKey);
+      if (saved && !accountCart) removeCompletedItems(payload, submittedProducts, submittedStorageKey);
+      if (saved && accountCart) {
+        try { await accountCart.refresh(); }
+        catch (_) { cartSyncStatus('error', 'Заказ сохранён. Не удалось обновить общую корзину — повторите загрузку.'); }
+      }
+      if (!current()) return;
       completedOrderFeedback(false, orderId, saved);
     }
   } catch (error) {
@@ -440,7 +551,7 @@ async function checkout(send) {
     if (error.status === 409) {
       try {
         if (state.config?.history_ready && (await jsonApi('/api/accounts/me')).user?.id !== state.user?.id) window.location.reload();
-        else await loadCatalog(false);
+        else { if (accountCart) await accountCart.refresh(); await loadCatalog(false); }
       } catch (_) { feedback('order-feedback', 'Обновите страницу, чтобы проверить текущий аккаунт и корзину.', true); }
     }
   } finally { state.busy = false; updateActions(); }
@@ -473,7 +584,10 @@ async function upload(event) {
 }
 async function loadCatalog(restore) {
   byId('load-error').hidden = true;
-  try { await setCatalog(await jsonApi('/api/catalog'), restore); }
+  try {
+    const catalog = await jsonApi('/api/catalog');
+    catalogVerified = true; cacheCatalog(catalog); await setCatalog(catalog, restore);
+  }
   catch (error) {
     byId('load-error').querySelector('span').textContent = 'Не удалось загрузить каталог. Проверьте соединение и повторите.';
     byId('load-error').hidden = false;
@@ -481,35 +595,51 @@ async function loadCatalog(restore) {
   }
 }
 async function start() {
+  initialising = true;
+  accountCart?.dispose(); accountCart = null;
+  const cached = cachedCatalog();
+  if (cached) await setCatalog(cached);
+  const catalogTask = loadCatalog(false);
   try {
-    const config = await jsonApi('/api/config');
+    const [config, identity] = await Promise.all([jsonApi('/api/config'), jsonApi('/api/accounts/me')]);
     state.config = config;
     byId('mail-note').textContent = config.mail_ready ? 'Заказ отправится поставщику по e-mail с Excel-вложением.' : 'Отправка почты пока не подключена. Готовый заказ можно скачать в Excel.';
     byId('admin-password').required = config.upload_requires_password;
     const note = byId('history-note');
     if (config.history_ready) {
-      const identity = await jsonApi('/api/accounts/me');
       state.user = identity.user;
       note.textContent = state.user ? 'Готовые заказы сохраняются в вашем личном списке.' : 'Войдите, чтобы оформлять и сохранять заказы: ';
       const link = node('a', '', state.user ? 'Мои заказы' : 'Вход и регистрация'); link.href = state.user ? '/orders/' : '/account/';
       note.append(document.createTextNode(' '), link);
     } else note.textContent = 'Сохранение истории на сервере пока не подключено. Excel-заказ можно скачать.';
     selectCartStorage();
+    const local = readLocalCart(); localCartMetadata = local?._shared || null;
+    await restoreCart(local); if (state.catalog.catalog_version) reconcileCart(); renderCart();
+    if (state.user && config.history_ready) await initialiseAccountCart(local);
     if (byId('account-link')) byId('account-link').textContent = state.user ? 'Мой аккаунт' : 'Войти';
     updateActions();
   } catch (_) {
     byId('mail-note').textContent = 'Не удалось проверить настройки и аккаунт. Обновите страницу, чтобы восстановить свой заказ.';
+    cartSyncStatus('error', 'Не удалось загрузить корзину аккаунта. Проверьте связь и повторите.');
   }
-  await loadCatalog(true);
+  await catalogTask;
+  initialising = false;
+  if (accountCart?.ready) {
+    reconcileCart(); renderCart();
+    const server = accountCart.lastServerDocument;
+    if (state.cart.size && server && !accountCart.matches(cartDocument())) saveCart();
+    else writeLocalCart();
+  } else if (storageKey && !state.user) writeLocalCart();
+  updateActions();
 }
 
 byId('search').addEventListener('input', () => { clearTimeout(searchTimer); searchTimer = setTimeout(filterProducts, 60); });
 byId('load-more').addEventListener('click', () => { state.shown += 60; renderProducts(); });
 for (const field of ['name', 'price']) byId('sort-' + field)?.addEventListener('click', () => sortProducts(field));
-byId('clear-cart').addEventListener('click', () => { if (state.busy) return; byId('clear-cart-dialog').showModal(); byId('clear-cart-cancel').focus(); });
+byId('clear-cart').addEventListener('click', () => { if (state.busy || !cartEditable()) return; byId('clear-cart-dialog').showModal(); byId('clear-cart-cancel').focus(); });
 for (const id of ['clear-cart-cancel', 'clear-cart-close']) byId(id).addEventListener('click', () => byId('clear-cart-dialog').close());
-byId('clear-cart-confirm').addEventListener('click', () => { if (state.busy) return; state.cart.clear(); state.cartProducts.clear(); basketChanged(); renderCart(); byId('clear-cart-dialog').close(); });
-byId('customer-form').addEventListener('input', () => { state.sentSignature = null; saveCart(); updateActions(); });
+byId('clear-cart-confirm').addEventListener('click', () => { if (state.busy || !cartEditable()) return; state.cart.clear(); state.cartProducts.clear(); basketChanged(); renderCart(); byId('clear-cart-dialog').close(); });
+byId('customer-form').addEventListener('input', () => { if (state.busy || !cartEditable()) return; state.sentSignature = null; saveCart(); updateActions(); });
 byId('customer-form').addEventListener('submit', (event) => event.preventDefault());
 byId('send-order').addEventListener('click', () => checkout(true));
 byId('download-order').addEventListener('click', () => checkout(false));
@@ -523,6 +653,38 @@ byId('retry-load').addEventListener('click', () => loadCatalog(false));
 byId('toggle-cart').addEventListener('click', () => setCartOpen(byId('order-panel').hidden, window.matchMedia('(max-width: 900px)').matches));
 byId('close-cart').addEventListener('click', () => setCartOpen(false));
 byId('jump-to-order').addEventListener('click', () => setCartOpen(byId('order-panel').hidden, true));
+byId('cart-sync-retry').addEventListener('click', async () => {
+  if (!accountCart?.ready) { window.location.reload(); return; }
+  try {
+    if (accountCart.pending) await accountCart.flush();
+    else await accountCart.refresh();
+  } catch (_) { /* Synchronization reports its own error and keeps the local draft. */ }
+});
+async function refreshAccountCart(checkCatalog = false) {
+  if (initialising || state.busy || document.visibilityState === 'hidden') return;
+  try {
+    if (accountCart?.ready) {
+      if (accountCart.pending) await accountCart.flush();
+      else await accountCart.refresh();
+    }
+    if (checkCatalog) await loadCatalog(false);
+  } catch (_) { /* Do not replace an unconfirmed draft after an unsuccessful refresh. */ }
+}
+setInterval(() => refreshAccountCart(), 20000);
+window.addEventListener('focus', () => refreshAccountCart(true));
+window.addEventListener('online', () => refreshAccountCart(true));
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshAccountCart(true); });
+window.addEventListener('pagehide', () => { if (accountCart?.ready && accountCart.pending) accountCart.flush({ keepalive: true }).catch(() => {}); });
+document.addEventListener('click', async (event) => {
+  if (event.defaultPrevented || event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || !accountCart?.ready || (!accountCart.pending && !accountCart.saving)) return;
+  const link = event.target.closest('a[href]');
+  if (!link || link.hasAttribute('download') || (link.target && link.target !== '_self')) return;
+  const destination = new URL(link.href, window.location.href);
+  if (destination.origin !== window.location.origin || (destination.pathname === window.location.pathname && destination.hash)) return;
+  event.preventDefault();
+  try { await accountCart.flush(); window.location.assign(destination.href); }
+  catch (_) { /* Keep the page open so a failed save can be retried. */ }
+});
 byId('order-panel').addEventListener('keydown', (event) => { if (event.key === 'Escape') { event.preventDefault(); setCartOpen(false); } });
 window.addEventListener('pageshow', (event) => { if (event.persisted) window.location.reload(); });
 start();

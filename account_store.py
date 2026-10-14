@@ -16,10 +16,12 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+from db_initialization import run_once
+
 SCHEMA = "okunev_orders"
 SESSION_SECONDS = 30 * 24 * 60 * 60
 PASSWORD_ITERATIONS = 600_000
-TABLES = "catalog_meta|catalog_archive|products|users|account_profiles|sessions|orders"
+TABLES = "catalog_meta|catalog_archive|products|users|account_profiles|account_carts|sessions|orders"
 
 
 class DuplicateAccount(ValueError):
@@ -32,6 +34,12 @@ class InvalidSession(ValueError):
 
 class IncorrectPassword(ValueError):
     pass
+
+
+class CartConflict(ValueError):
+    def __init__(self, state):
+        super().__init__("Cart changed on another device")
+        self.state = state
 
 
 def postgres_configured():
@@ -98,10 +106,12 @@ def postgres_database():
                           **postgres_tls_options(dsn))
     connection = PostgresConnection(raw)
     try:
-        # All later table references are schema-qualified by the adapter.
-        connection.execute("BEGIN IMMEDIATE")
-        raw.execute(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}")
-        connection.commit()
+        def initialize_schema():
+            # All later table references are schema-qualified by the adapter.
+            connection.execute("BEGIN IMMEDIATE")
+            raw.execute(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}")
+            connection.commit()
+        run_once(dsn, "schema", initialize_schema)
         yield connection
     finally:
         connection.close()
@@ -123,7 +133,7 @@ def database():
         raise RuntimeError("Persistent order history is not configured")
     if postgres_configured():
         with postgres_database() as connection:
-            initialize(connection, "BYTEA")
+            run_once(os.environ["ORDERS_DATABASE_URL"].strip(), "accounts", lambda: initialize(connection, "BYTEA"))
             yield connection
     else:
         directory = Path(os.environ["ORDERS_HISTORY_DIR"].strip())
@@ -150,6 +160,10 @@ def initialize(connection, binary_type):
             user_id TEXT PRIMARY KEY REFERENCES users(id),
             name TEXT NOT NULL, phone TEXT NOT NULL,
             company TEXT NOT NULL, delivery_address TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS account_carts (
+            user_id TEXT PRIMARY KEY REFERENCES users(id), revision BIGINT NOT NULL,
+            document TEXT NOT NULL, updated_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS sessions (
             token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id),
@@ -294,12 +308,114 @@ def save_profile(user, details):
     return {"email": user["email"], **details}
 
 
+def require_live_session(connection, user_id, session_token):
+    if not session_token or len(session_token) > 256:
+        raise InvalidSession("Session is no longer valid")
+    row = connection.execute("""
+        SELECT user_id FROM sessions WHERE token_hash = ? AND user_id = ? AND expires_at > ?
+    """, (token_hash(session_token), user_id, int(time.time()))).fetchone()
+    if row is None:
+        raise InvalidSession("Session is no longer valid")
+
+
+def cart_state(connection, user_id):
+    row = connection.execute("SELECT revision, document FROM account_carts WHERE user_id = ?", (user_id,)).fetchone()
+    return {"revision": int(row["revision"]), "cart": json.loads(row["document"])} if row else {"revision": 0, "cart": None}
+
+
+def cart(user_id):
+    with database() as connection:
+        return cart_state(connection, user_id)
+
+
+def write_cart(connection, user_id, revision, document):
+    connection.execute("""
+        INSERT INTO account_carts (user_id, revision, document, updated_at) VALUES (?, ?, ?, ?)
+        ON CONFLICT (user_id) DO UPDATE SET revision = excluded.revision,
+            document = excluded.document, updated_at = excluded.updated_at
+    """, (user_id, revision, json.dumps(document, ensure_ascii=False), datetime.now(timezone.utc).isoformat()))
+    return {"revision": revision, "cart": document}
+
+
+def save_cart(user_id, session_token, expected_revision, document):
+    with database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        require_live_session(connection, user_id, session_token)
+        current = cart_state(connection, user_id)
+        if current["revision"] != expected_revision:
+            raise CartConflict(current)
+        saved = write_cart(connection, user_id, expected_revision + 1, document)
+        connection.commit()
+        return saved
+
+
+def checked_cart(connection, user_id, expected_revision, submitted):
+    current = cart_state(connection, user_id)
+    if current["revision"] != expected_revision or current["cart"] is None:
+        raise CartConflict(current)
+    saved_items = {item["product_id"]: item for item in current["cart"]["items"]}
+    for item in submitted:
+        saved = saved_items.get(item["product_id"])
+        if (saved is None or saved["quantity"] < item["quantity"]
+                or saved["product"].get("available") is False):
+            raise CartConflict(current)
+    return current
+
+
+def complete_cart(connection, user_id, current, submitted):
+    quantities = {item["product_id"]: item["quantity"] for item in submitted}
+    remaining = []
+    for item in current["cart"]["items"]:
+        quantity = item["quantity"] - quantities.get(item["product_id"], 0)
+        if quantity > 0:
+            remaining.append({**item, "quantity": quantity})
+    document = {**current["cart"], "items": remaining}
+    saved = write_cart(connection, user_id, current["revision"] + 1, document)
+    return {"cart_completed": True, "cart_revision": saved["revision"]}
+
+
+def insert_order(connection, user_id, order_id, created_at, filename, status, total, positions, customer, document):
+    connection.execute("INSERT INTO orders VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                       (order_id, user_id, created_at, filename, status, str(total),
+                        json.dumps(positions, ensure_ascii=False), json.dumps(customer, ensure_ascii=False), document))
+
+
 def save_order(user_id, order_id, created_at, filename, status, total, positions, customer, document):
     with database() as connection:
-        connection.execute("INSERT INTO orders VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                           (order_id, user_id, created_at, filename, status, str(total),
-                            json.dumps(positions, ensure_ascii=False), json.dumps(customer, ensure_ascii=False), document))
+        insert_order(connection, user_id, order_id, created_at, filename, status, total, positions, customer, document)
         connection.commit()
+
+
+def save_order_with_cart(user_id, session_token, expected_revision, submitted, order_id, created_at,
+                         filename, status, total, positions, customer, document):
+    with database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        require_live_session(connection, user_id, session_token)
+        current = checked_cart(connection, user_id, expected_revision, submitted)
+        insert_order(connection, user_id, order_id, created_at, filename, status, total, positions, customer, document)
+        result = (complete_cart(connection, user_id, current, submitted) if status == "exported"
+                  else {"cart_completed": False, "cart_revision": current["revision"]})
+        connection.commit()
+        return result
+
+
+def finish_sent_order(user_id, session_token, order_id, expected_revision, submitted):
+    with database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("UPDATE orders SET status = ? WHERE id = ? AND user_id = ?", ("sent", order_id, user_id))
+        current = cart_state(connection, user_id)
+        result = {"cart_completed": False, "cart_revision": current["revision"]}
+        # Sending has already succeeded: preserve that fact even if another
+        # device changed the draft or the initiating session was revoked.
+        try:
+            require_live_session(connection, user_id, session_token)
+            current = checked_cart(connection, user_id, expected_revision, submitted)
+        except (CartConflict, InvalidSession):
+            pass
+        else:
+            result = complete_cart(connection, user_id, current, submitted)
+        connection.commit()
+        return result
 
 
 def update_order_status(user_id, order_id, status):
