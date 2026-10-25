@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <meta name="theme-color" content="#0b1420" />
+  <meta name="description" content="Браузерная пошаговая карточная тактика для двоих: поле 5×6, отряды, битвы по сети." />
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="/style.css" />
+  <title>Рубеж стихий — карточная онлайн-тактика</title>
+</head>
+<body>
+  <div class="stars"></div>
+  <div class="shell">
+    <header class="brand"><div class="brandmark">✦</div><div><h1>РУБЕЖ <span>СТИХИЙ</span></h1><p>Карточная тактика • Онлайн-арена</p></div><span class="tag">ПРОТОТИП 0.1</span></header>
+    <main>
+      <section id="home" class="panel home">
+        <div class="eyebrow">Фэнтези · Пошаговая стратегия · PvP</div>
+        <h2>Собери отряд.<br/><em>Завоюй арену.</em></h2>
+        <p class="lead">Старая добрая карточная тактика на поле 5×6: нанимай существ за кристаллы, расставляй их и сражайся с другим игроком. Открывается в браузере телефона.</p>
+        <label class="inputlabel" for="name">Твоё имя на арене</label>
+        <input id="name" maxlength="22" placeholder="Например, Странник" autocomplete="nickname" />
+        <div class="bigactions"><button id="quick" class="primary">⚔ Найти соперника</button><button id="create">＋ Создать комнату</button></div>
+        <div class="joinrow"><input id="roomInput" maxlength="6" placeholder="КОД КОМНАТЫ" aria-label="Код комнаты"/><button id="join">Войти по коду</button></div>
+        <button id="bot" class="quiet">♟ Попробовать с ботом без ожидания</button>
+        <div class="features"><span>▦ Поле 5×6</span><span>✧ 12 типов карт</span><span>⚔ Бои 1 на 1</span><span>📱 Телефон и ПК</span></div>
+        <p class="legal">Это самостоятельный демонстрационный проект, вдохновлённый классическими карточными тактическими играми. Неофициальная игра, без оригинальных иллюстраций и карт «Берсерка».</p>
+      </section>
+      <section id="game" hidden>
+        <div class="roomBar panel"><div><span class="eyebrow">КОМНАТА</span><strong id="roomCode">—</strong></div><button id="copyRoom" class="small">🔗 Пригласить</button><button id="leave" class="small quiet">В меню</button></div>
+        <div class="combatbar"><div class="combatant left"><span class="medallion">🛡️</span><div><small>ТЫ</small><strong id="playerName">—</strong></div></div><div class="midbattle"><small id="phaseLabel">Ожидание</small><strong id="turnLabel">VS</strong></div><div class="combatant right"><div><small>СОПЕРНИК</small><strong id="enemyName">—</strong></div><span class="medallion red">⚔️</span></div></div>
+        <section id="waitingPanel" class="panel waiting" hidden><div class="spark">✧</div><h2>Ожидание противника</h2><p>Отправь другу ссылку или код комнаты. Он сможет зайти с другого телефона или компьютера.</p><div class="waitingCode" id="waitingCode">—</div><button id="waitingCopy" class="primary">Скопировать ссылку-приглашение</button></section>
+        <section id="draftPanel" class="panel draft" hidden><div class="sectitle"><div><span class="eyebrow">ШАГ 1 / 2</span><h2>Набери свой отряд</h2><p>Выбери 3–6 существ. Элитные карты покупаются только за золото.</p></div><div class="resources"><span>🟡 <b id="gold">24</b></span><span>⚪ <b id="silver">22</b></span></div></div><div id="myDraft" class="draftLine"></div><div id="cards" class="cards"></div><div class="stickybar"><span id="draftHint">Выбери минимум 3 карты</span><button class="primary" id="ready">Завершить набор →</button></div></section>
+        <section id="boardPanel" hidden><div class="panel boardHeading"><div class="eyebrow" id="step">ШАГ 2 / 2</div><h2 id="boardTitle">Расставь существ</h2><p id="boardHelp">Выбери карту ниже и нажми на клетку своей половины поля.</p></div><div id="board" class="board" role="grid" aria-label="Игровое поле 5 на 6"></div><div id="unitPanel" class="panel unitPanel"></div><div id="bench" class="panel bench" hidden></div><div id="boardActions" class="stickybar boardActions"></div></section>
+        <section id="resultPanel" class="panel result" hidden></section>
+        <section id="logPanel" class="panel log" hidden><h3>📜 Летопись боя</h3><div id="log"></div></section>
+      </section>
+    </main>
+    <footer>РУБЕЖ СТИХИЙ · Независимый игровой прототип · Комнаты хранятся временно</footer>
+  </div>
+  <div id="toast" role="status" aria-live="polite"></div>
+  <script defer src="/app.js"></script>
+</body>
+</html>
