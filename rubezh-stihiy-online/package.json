@@ -1,0 +1,12 @@
+{
+  "name": "rubezh-stihiy-online",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Онлайн-прототип пошаговой карточной тактики для двоих с полем 5 на 6",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {"node": ">=18"},
+  "license": "UNLICENSED"
+}
